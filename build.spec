@@ -15,7 +15,7 @@ for pkg in ("transformers", "tokenizers", "safetensors", "huggingface_hub", "reg
 # Finche' rizzo-pii-0.3B non e' stato addestrato si puo' usare models/pii_model_legacy.
 datas += [("models/rizzo-pii-0.3B-v1.5.0", "pii_model")]
 datas += [("src/app/assets", "assets")]   # mascotte/icone -> app.py le serve da _resource_path("assets")
-hiddenimports += ["fitz", "flask", "sklearn.utils._typedefs"]
+hiddenimports += ["fitz", "flask", "openpyxl", "sklearn.utils._typedefs"]
 
 # escludi tutto cio' che non serve (riduce dimensione e rumore)
 excludes = [

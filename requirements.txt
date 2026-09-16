@@ -25,9 +25,10 @@ huggingface_hub
 wandb
 python-dotenv
 
-# Local anonymization app (Flask UI + PDF parsing)
+# Local anonymization app (Flask UI + PDF parsing + Excel)
 flask
 pymupdf
+openpyxl
 
 # Loss / metric plots produced by the training script
 matplotlib

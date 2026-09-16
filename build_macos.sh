@@ -39,7 +39,7 @@ command -v npm   >/dev/null || { echo "ERRORE: npm non trovato (installa Node.js
 if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --upgrade pip
-  "$VENV/bin/pip" install torch "transformers==4.57.3" tokenizers safetensors flask pymupdf pyinstaller
+  "$VENV/bin/pip" install torch "transformers==4.57.3" tokenizers safetensors flask pymupdf openpyxl pyinstaller
 fi
 "$VENV/bin/python" -c "import PyInstaller" 2>/dev/null \
   || "$VENV/bin/pip" install pyinstaller

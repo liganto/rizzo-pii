@@ -16,7 +16,7 @@ for pkg in ("transformers", "tokenizers", "safetensors", "huggingface_hub", "reg
 # modello + asset grafici impacchettati (app.py li risolve via _resource_path / _MEIPASS)
 datas += [("models/rizzo-pii-0.3B-v1.5.0", "pii_model")]
 datas += [("src/app/assets", "assets")]
-hiddenimports += ["fitz", "flask", "sklearn.utils._typedefs"]
+hiddenimports += ["fitz", "flask", "openpyxl", "sklearn.utils._typedefs"]
 
 excludes = [
     "tensorflow", "tensorflow_intel", "tf_keras", "keras", "jax", "jaxlib", "flax",
