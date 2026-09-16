@@ -21,10 +21,21 @@ l'anonimizzazione diventa definitiva, nessuna chiave placeholder->valore viene c
 
 Endpoint HTTP:
   GET  /health    liveness/readiness senza inference (200 = modello caricato, 503 = no)
-  POST /analyze   {"text": ...} oppure multipart con un file (.pdf/.md/.txt); campi
+  POST /analyze   {"text": ...} oppure multipart con un file (.pdf/.md/.txt/.xlsx); campi
                   opzionali "exclude_tags" e "include_mapping" per override per-richiesta
   POST /pdf       stesso input di /analyze -> scarica il PDF ANONIMIZZATO (redazione
                   vera del PDF caricato, oppure PDF ricostruito dal testo)
+  POST /xlsx      multipart con un .xlsx -> scarica lo stesso foglio con le celle
+                  ANONIMIZZATE (formattazione e struttura intatte, vedi xlsx_export.py);
+                  con include_mapping=1 risponde JSON {xlsx_base64, mapping, types, ...}
+  POST /xlsx/restore  multipart: .xlsx anonimizzato + dizionario (file "dictionary" o
+                  campo "mapping") -> scarica l'Excel con i valori veri RIPRISTINATI
+  POST /xlsx/columns  multipart con un .xlsx -> PROFILO delle colonne (tipo, distinti,
+                  forma, tag proposto): per le ESTRAZIONI TABELLARI, dove si decide per
+                  colonna invece di far indovinare il modello cella per cella
+  POST /xlsx/columns/anonymize  multipart: .xlsx + "columns" = JSON
+                  {intestazione: "mask"|"year"|"empty"|"keep"} -> Excel anonimizzato
+                  (o JSON con dizionario, come /xlsx, se include_mapping=1)
   POST /preview   multipart con un .pdf -> lo tiene in memoria per l'ANTEPRIMA a video e
                   ritorna {doc_id, n_pages, text}
   POST /pdf/preview  come /pdf, ma invece del binario ritorna {doc_id, n_pages, ...}:
@@ -43,7 +54,9 @@ Preferenze di anonimizzazione (precedenza): campo nella richiesta > CLI --exclud
   --no-mapping > env PII_EXCLUDE_TAGS/PII_MAPPING > prefs.json > default
 """
 
+import base64
 import bisect
+import json
 import os
 import re
 import secrets
@@ -59,6 +72,8 @@ from flask import (Flask, jsonify, render_template_string, request,
 
 import pdf_export
 import server_config
+import tabular
+import xlsx_export
 # Rete REGEX + CHECKSUM: modulo a parte, senza dipendenze dal modello. I nomi
 # restano importabili da qui (`app.detect_regex`) per non rompere chi li usa.
 from detectors import (DETECTORS, SOFT_REGEX_LABELS, cf_ok,  # noqa: F401
@@ -141,8 +156,10 @@ print("Modello pronto.")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# Estensioni accettate dall'upload (il PDF passa da PyMuPDF, il resto e' testo puro).
+# Estensioni accettate dall'upload (il PDF passa da PyMuPDF, l'Excel da openpyxl,
+# il resto e' testo puro).
 TEXT_EXTS = {".md", ".markdown", ".txt", ".text"}
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # --------------------------------------------------------------------------- #
 # Anteprima a video dei PDF (documento caricato a sinistra, anonimizzato a destra)
@@ -498,13 +515,23 @@ def _is_pdf(name, data):
     return os.path.splitext((name or "").lower())[1] == ".pdf" or data[:5] == b"%PDF-"
 
 
+def _is_xlsx(name):
+    return os.path.splitext((name or "").lower())[1] == ".xlsx"
+
+
 def _text_from_bytes(name, data):
-    """Testo dai bytes di un upload: PDF via PyMuPDF, .md/.txt come testo puro."""
+    """Testo dai bytes di un upload: PDF via PyMuPDF, .xlsx steso in righe con le
+    celle separate da TAB (xlsx_export), .md/.txt come testo puro."""
     name = (name or "").lower()
     ext = os.path.splitext(name)[1]
     if _is_pdf(name, data):
         with fitz.open(stream=data, filetype="pdf") as doc:
             return "\n".join(page.get_text() for page in doc)
+    if _is_xlsx(name):
+        return xlsx_export.workbook_text(data)       # XlsxError e' un ValueError
+    if ext in (".xls", ".xlsm", ".xlsb", ".ods"):
+        raise ValueError(f"Formato {ext} non supportato: salva il foglio come .xlsx "
+                         "(Excel: File > Salva con nome) e ricaricalo.")
     if ext in TEXT_EXTS or not ext:
         for enc in ("utf-8-sig", "utf-16", "latin-1"):
             try:
@@ -513,7 +540,7 @@ def _text_from_bytes(name, data):
                 continue
     raise ValueError(
         f"Formato non supportato: {ext or name or 'sconosciuto'}. "
-        "Accetto .pdf, .md, .txt oppure testo incollato."
+        "Accetto .pdf, .xlsx, .md, .txt oppure testo incollato."
     )
 
 
@@ -684,6 +711,175 @@ def pdf_preview_route():
         "skipped": len(report.get("skipped", [])),
         "not_found": len(report.get("not_found", [])),
     })
+
+
+# --------------------------------------------------------------------------- #
+# Excel anonimizzato da scaricare
+# --------------------------------------------------------------------------- #
+@app.route("/xlsx", methods=["POST"])
+def xlsx_route():
+    """Scarica il foglio Excel ANONIMIZZATO. Multipart con un .xlsx (stesso campo
+    "pdf"/"file" di /analyze) e campo opzionale "exclude_tags".
+
+    Il workbook viene steso in un testo solo (una riga per riga, celle separate da
+    TAB), analizzato con UNA chiamata ad analyze() e ricostruito cella per cella:
+    formattazione, tipi e struttura restano, cambiano solo i valori (vedi
+    xlsx_export.py). Come per /pdf il dizionario non viaggia sulla rete: serve a
+    propagare i valori nel resto del file e muore con la richiesta."""
+    up = _uploaded_file()
+    if up is None:
+        return jsonify({"error": "Nessun file Excel caricato."}), 400
+    name, data = up.filename, up.read()
+    if not _is_xlsx(name):
+        return jsonify({"error": "Serve un file .xlsx."}), 400
+    try:
+        layout = xlsx_export.read_workbook(data)
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+    text = layout.text                               # NON strip(): gli offset contano
+    if not text.strip():
+        return jsonify({"error": "Il foglio e' vuoto."}), 400
+
+    raw_excl = request.form.get("exclude_tags")
+    excl = server_config.parse_tag_list(raw_excl) if raw_excl is not None else EXCLUDED_TAGS
+    res = analyze(text, excl, mapping_enabled=True)  # interno: la mappa non esce da qui
+    if not res["mapping"]:
+        return jsonify({"error": "Nessuna PII trovata: non c'e' niente da "
+                                 "anonimizzare in questo foglio."}), 422
+    out, report = xlsx_export.write_workbook(
+        layout, xlsx_export.spans_from_segments(res["segments"]), res["mapping"])
+
+    stem = os.path.splitext(_safe_name(name, "foglio.xlsx"))[0] or "foglio"
+    out_name = f"{stem}_anonimizzato.xlsx"
+    # Con include_mapping il client chiede ESPLICITAMENTE la chiave di ripristino
+    # (come fa /analyze): JSON con il file in base64 + dizionario + tipi delle celle.
+    # Senza, la risposta resta il binario e la mappa muore qui.
+    raw_map = request.form.get("include_mapping")
+    if raw_map is not None and server_config.parse_bool(raw_map, False):
+        return jsonify({
+            "filename": out_name,
+            "xlsx_base64": base64.b64encode(out).decode("ascii"),
+            "mapping": res["mapping"],
+            "types": report["types"],
+            "redactions": report["occurrences"],
+            "residual": len(report["residual"]),
+            "skipped": len(report["skipped"]),
+        })
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={out_name}"
+    resp.headers["X-PII-Redactions"] = str(report["occurrences"])
+    resp.headers["X-PII-Residual"] = str(len(report["residual"]))
+    resp.headers["X-PII-Skipped"] = str(len(report["skipped"]))
+    return resp
+
+
+@app.route("/xlsx/columns", methods=["POST"])
+def xlsx_columns_route():
+    """Profilo delle colonne di un'estrazione tabellare: tipo, valori distinti, forma
+    (lettere -> A, cifre -> 9) e tag proposto, dedotto dal nome della colonna e dai
+    valori passati alla rete regex+checksum. Nessuna inferenza del modello e NESSUN
+    valore reale nella risposta: solo forme. Campi opzionali "sheet" e "header_row"."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica un file .xlsx."}), 400
+    try:
+        head_row = int(request.form.get("header_row") or 1)
+        prof = tabular.profile(up.read(), request.form.get("sheet") or None, head_row)
+    except (ValueError, xlsx_export.XlsxError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(prof)
+
+
+@app.route("/xlsx/columns/anonymize", methods=["POST"])
+def xlsx_columns_anonymize_route():
+    """Anonimizzazione PER COLONNA (vedi tabular.py): niente modello, niente falsi
+    positivi sulle colonne di misura, e il tempo non dipende dal numero di righe.
+
+    Multipart: il .xlsx + "columns" = JSON {intestazione: "mask"|"year"|"empty"|"keep"}.
+    Come /xlsx: risposta binaria, oppure JSON con {xlsx_base64, mapping, types} se
+    include_mapping=1. Il dizionario e' quello di xlsx_export, quindi si ripristina
+    con /xlsx/restore."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica un file .xlsx."}), 400
+    raw = request.form.get("columns") or ""
+    if not raw:
+        return jsonify({"error": "Manca la scelta delle colonne (campo \"columns\")."}), 400
+    try:
+        scelte = json.loads(raw)
+        if not isinstance(scelte, dict):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        return jsonify({"error": "Campo \"columns\" non valido: serve un oggetto JSON "
+                                 "{intestazione: modalita'}."}), 400
+    try:
+        head_row = int(request.form.get("header_row") or 1)
+        out, report = tabular.anonymize(up.read(), scelte,
+                                        request.form.get("sheet") or None, head_row)
+    except (ValueError, xlsx_export.XlsxError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not report["cells"]:
+        return jsonify({"error": "Nessuna cella da anonimizzare: controlla le colonne "
+                                 "scelte."}), 422
+
+    stem = os.path.splitext(_safe_name(up.filename, "foglio.xlsx"))[0] or "foglio"
+    out_name = f"{stem}_anonimizzato.xlsx"
+    raw_map = request.form.get("include_mapping")
+    if raw_map is not None and server_config.parse_bool(raw_map, False):
+        return jsonify({
+            "filename": out_name,
+            "xlsx_base64": base64.b64encode(out).decode("ascii"),
+            "mapping": report["mapping"],
+            "types": report["types"],
+            "columns": report["columns"],
+            "ignored": report["ignored"],
+            "cells": report["cells"],
+            "left": report["left"],
+        })
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={out_name}"
+    resp.headers["X-PII-Redactions"] = str(report["cells"])
+    resp.headers["X-PII-Left"] = str(report["left"])
+    return resp
+
+
+@app.route("/xlsx/restore", methods=["POST"])
+def xlsx_restore_route():
+    """Rimette i valori veri in un Excel anonimizzato, anche se nel frattempo e' stato
+    modificato (righe o colonne aggiunte da un LLM). Multipart: il .xlsx (campo
+    "file"/"pdf") + il dizionario, come file JSON nel campo "dictionary" oppure come
+    testo JSON nel campo "mapping". Formato = quello che scarica l'UI:
+    {placeholder: valore} piu' la chiave facoltativa "_types" per ridare a numeri e
+    date il loro tipo. Nessuna inferenza: funziona anche col modello non caricato."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica il file .xlsx anonimizzato."}), 400
+    if "dictionary" in request.files:
+        raw = request.files["dictionary"].read()
+    else:
+        raw = request.form.get("mapping") or ""
+    if not raw:
+        return jsonify({"error": "Manca il dizionario: carica il file JSON scaricato "
+                                 "insieme all'Excel anonimizzato."}), 400
+    try:
+        mapping, types = xlsx_export.parse_dictionary(json.loads(raw))
+    except json.JSONDecodeError:
+        return jsonify({"error": "Dizionario non valido: serve il file JSON scaricato "
+                                 "insieme all'Excel anonimizzato."}), 400
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        out, report = xlsx_export.restore_workbook(up.read(), mapping, types)
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+
+    stem = os.path.splitext(_safe_name(up.filename, "foglio.xlsx"))[0] or "foglio"
+    stem = re.sub(r"_anonimizzato$", "", stem)
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={stem}_ripristinato.xlsx"
+    resp.headers["X-PII-Restored"] = str(report["restored"])
+    resp.headers["X-PII-Unknown"] = str(len(report["unknown"]))
+    return resp
 
 
 # --------------------------------------------------------------------------- #
@@ -1150,7 +1346,7 @@ PAGE = r"""
           <label class="drop" id="drop">
             <span class="ic">📄</span>
             <span id="dropTxt">Trascina un <b>PDF</b> o un <b>.md</b> qui, oppure <b>scegli un file</b></span>
-            <input type="file" id="pdf" accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain" hidden>
+            <input type="file" id="pdf" accept=".pdf,.xlsx,.md,.markdown,.txt,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/markdown,text/plain" hidden>
           </label>
           <div class="mapsw" id="mapSw">
             <button class="tsw" id="mapToggle" role="switch" aria-checked="true"
@@ -1195,9 +1391,43 @@ PAGE = r"""
           <div class="row">
             <button class="btn" id="copy">📋 <span data-i18n="copy">Copia per ChatGPT</span></button>
             <button class="ghost" id="dlpdf">📄 <span data-i18n="dlpdf">Scarica PDF anonimizzato</span></button>
+            <button class="ghost" id="dlxlsx" style="display:none">📊 <span data-i18n="dlxlsx">Scarica Excel anonimizzato</span></button>
             <button class="ghost" id="dl">⬇️ <span data-i18n="dl">Scarica dizionario</span></button>
             <span class="hint" id="ulock"></span>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ESTRAZIONE TABELLARE: si decide per colonna invece di far indovinare il
+         modello cella per cella (vedi tabular.py). Compare caricando un .xlsx. -->
+    <div class="card dict" id="colCard" style="display:none">
+      <div class="hd">
+        <h2 data-i18n="col_title">Colonne del foglio</h2>
+        <div class="right">
+          <label class="chip" style="cursor:pointer"><input type="checkbox" id="colToggle" checked>
+            <span data-i18n="col_mode_on">decidi per colonna</span></label>
+          <span class="hint" id="colInfo"></span>
+        </div>
+      </div>
+      <div class="bd">
+        <div class="callout"><span class="ic">💡</span>
+          <div data-i18n="col_hint">Su un'estrazione tabellare il modello sbaglia: un codice a cinque
+          cifre somiglia a un documento o a un importo. Qui decidi <b>una volta per colonna</b>:
+          la proposta viene dal nome della colonna e dai valori (con i checksum di CF, IVA e IBAN).
+          È immediato e non tocca le colonne di misura.</div>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th data-i18n="col_head">Colonna</th>
+              <th data-i18n="col_shape">Forma</th>
+              <th data-i18n="col_distinct">Distinti</th>
+              <th data-i18n="col_tag">Riconosciuta come</th>
+              <th data-i18n="col_mode">Trattamento</th>
+            </tr></thead>
+            <tbody id="colrows"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -1250,6 +1480,13 @@ PAGE = r"""
             <button class="btn lg" id="rev">🔓 <span data-i18n="rev">Ripristina valori</span></button>
             <button class="ghost" id="rclear" data-i18n="clear">Pulisci</button>
             <span class="hint" id="dictInfo"></span>
+          </div>
+          <!-- Excel: stesso dizionario, ma sul file anonimizzato (anche modificato da un LLM) -->
+          <div class="row">
+            <label class="chip" style="cursor:pointer"><span data-i18n="rx_load">📊 Carica Excel anonimizzato</span>
+              <input type="file" id="rxlsx" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden></label>
+            <button class="ghost" id="rxlsxgo">🔓 <span data-i18n="rx_go">Scarica Excel ripristinato</span></button>
+            <span class="hint" id="rxlsxName"></span>
           </div>
         </div>
       </div>
@@ -1317,6 +1554,13 @@ PAGE = r"""
 const $ = id => document.getElementById(id);
 let DATA = null;            // ultimo risultato analyze
 let MAP = {};              // {placeholder -> valore} sessione corrente
+let MAP_TYPES = {};        // {placeholder -> "int"|"datetime"|...}: tipo delle celle Excel intere
+const XLSX_MIME='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+/* il dizionario scaricato per un Excel ha anche "_types": in MAP vanno solo i placeholder */
+function phOnly(o){const m={};for(const [k,v] of Object.entries(o||{}))
+  if(typeof v==='string'&&/^\[.+\]$/.test(k))m[k]=v;return m;}
+function saveBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 const off = new Set();     // label nascoste nella preview
 let L = 'it';              // lingua UI corrente
 let TAGS = [];             // legenda dei tag servita da /settings
@@ -1333,9 +1577,9 @@ const T = {
   tagline:"modello locale su CPU · GDPR compliant", badge:"100% in locale",
   notice:"<b>Versione in sviluppo.</b> Il modello AI non è perfetto e può commettere errori: verifica sempre il risultato prima di usarlo. Queste sono le prime versioni e il progetto è completamente <b>open source</b>. Se ti è utile, <b>lascia una ⭐ alla repo</b> e contribuisci a migliorarlo: <a href=\"https://github.com/Rizzo-AI-Academy/rizzo-pii\" target=\"_blank\" rel=\"noopener\">apri la repo su GitHub ↗</a>",
   tab1:"Anonimizza", tab2:"Ripristina la risposta",
-  in_title:"① Il tuo documento", in_hint:"incolla testo o trascina un PDF / .md",
-  src_ph:"Incolla qui il testo dell'atto, del contratto o della sentenza…\n\nOppure trascina un PDF o un file .md nell'area qui sotto.",
-  drop:"Trascina un <b>PDF</b> o un <b>.md</b> qui, oppure <b>scegli un file</b>",
+  in_title:"① Il tuo documento", in_hint:"incolla testo o trascina un PDF / .xlsx / .md",
+  src_ph:"Incolla qui il testo dell'atto, del contratto o della sentenza…\n\nOppure trascina un PDF, un Excel (.xlsx) o un file .md nell'area qui sotto.",
+  drop:"Trascina un <b>PDF</b>, un <b>.xlsx</b> o un <b>.md</b> qui, oppure <b>scegli un file</b>",
   go:"Anonimizza", clear:"Pulisci",
   out_title:"② Risultato", v_prev:"Anteprima", v_text:"Testo da copiare",
   v_pdf:"Anteprima PDF", v_raw:"Testo", v_opdf:"PDF censurato",
@@ -1346,6 +1590,15 @@ const T = {
   copy:"Copia per ChatGPT", dl:"Scarica dizionario", dlpdf:"Scarica PDF anonimizzato",
   t_pdf_making:"Genero il PDF…", t_pdf_ok:"PDF anonimizzato scaricato",
   t_pdf_err:"Errore nella creazione del PDF",
+  col_title:"Colonne del foglio", col_mode_on:"decidi per colonna",
+  col_head:"Colonna", col_shape:"Forma", col_distinct:"Distinti",
+  col_tag:"Riconosciuta come", col_mode:"Trattamento",
+  m_mask:"anonimizza", m_keep:"lascia in chiaro", m_year:"solo l'anno", m_empty:"svuota",
+  col_qi:"incrociabile", col_qi_t:"Poche categorie: da sola non identifica, ma incrociata con le altre colonne può farlo",
+  col_info:(foglio,righe,colonne)=>foglio+" · "+righe+" righe · "+colonne+" colonne",
+  dlxlsx:"Scarica Excel anonimizzato", t_xlsx_making:"Genero l'Excel…",
+  t_xlsx_ok:"Excel anonimizzato scaricato", t_xlsx_err:"Errore nella creazione dell'Excel",
+  t_xlsx_warn:n=>"Excel scaricato · ATTENZIONE: "+n+" valori potrebbero essere rimasti in chiaro",
   t_pdf_warn:(r,s)=>"PDF scaricato · ATTENZIONE: "+(r+s)+" valori sono rimasti in chiaro"
     +" ("+r+" non redatti, "+s+" troppo corti per essere cercati): controlla il file"
     +" prima di condividerlo",
@@ -1355,6 +1608,10 @@ const T = {
   r_title1:"Risposta con i placeholder", loaddict:"📁 Carica dizionario",
   rin_ph:"Incolla qui la risposta di ChatGPT…",
   rev:"Ripristina valori", r_title2:"Testo ripristinato",
+  rx_load:"📊 Carica Excel anonimizzato", rx_go:"Scarica Excel ripristinato",
+  t_rx_need:"Carica prima l'Excel anonimizzato (.xlsx)", t_rx_making:"Ripristino l'Excel…",
+  t_rx_ok:"Excel ripristinato scaricato", t_rx_err:"Errore nel ripristino dell'Excel",
+  t_rx_unknown:n=>"Excel ripristinato · "+n+" placeholder non sono nel dizionario e sono rimasti com'erano",
   empty_rout:"Il testo con i valori reali apparirà qui.", rcopy:"Copia testo ripristinato",
   st_ent:"entità", st_uniq:"valori unici", st_model:"dal modello",
   st_regex:"da regex/checksum", st_chars:"caratteri", analyzing:"Analizzo…",
@@ -1365,7 +1622,7 @@ const T = {
   t_no_dict:"Nessun dizionario: caricane uno .json", t_restored:"Valori ripristinati",
   t_nothing_copy:"Niente da copiare", t_restored_copied:"Testo ripristinato copiato",
   t_dict_loaded:"Dizionario caricato", t_json_invalid:"JSON non valido",
-  t_drag_pdf:"Formato non supportato: usa PDF, .md o .txt",
+  t_drag_pdf:"Formato non supportato: usa PDF, .xlsx, .md o .txt",
   pii_found:(n,u)=>n+" PII trovate · "+u+" valori unici",
   dict_n:n=>n+" ID nel dizionario",
   dict_loaded_n:n=>"dizionario caricato · "+n+" ID",
@@ -1396,9 +1653,9 @@ const T = {
   tagline:"local model on CPU · GDPR compliant", badge:"100% local",
   notice:"<b>Work in progress.</b> The AI model isn't perfect and can make mistakes: always double-check the result before relying on it. These are the very first versions and the project is fully <b>open source</b>. If you find it useful, <b>leave a ⭐ on the repo</b> and help improve it: <a href=\"https://github.com/Rizzo-AI-Academy/rizzo-pii\" target=\"_blank\" rel=\"noopener\">open the repo on GitHub ↗</a>",
   tab1:"Anonymize", tab2:"Restore the answer",
-  in_title:"① Your document", in_hint:"paste text or drop a PDF / .md",
-  src_ph:"Paste here the text of the deed, contract or judgment…\n\nOr drop a PDF or a .md file onto the area below.",
-  drop:"Drop a <b>PDF</b> or a <b>.md</b> here, or <b>choose a file</b>",
+  in_title:"① Your document", in_hint:"paste text or drop a PDF / .xlsx / .md",
+  src_ph:"Paste here the text of the deed, contract or judgment…\n\nOr drop a PDF, an Excel (.xlsx) or a .md file onto the area below.",
+  drop:"Drop a <b>PDF</b>, an <b>.xlsx</b> or a <b>.md</b> here, or <b>choose a file</b>",
   go:"Anonymize", clear:"Clear",
   out_title:"② Result", v_prev:"Preview", v_text:"Text to copy",
   v_pdf:"PDF preview", v_raw:"Text", v_opdf:"Redacted PDF",
@@ -1409,6 +1666,15 @@ const T = {
   copy:"Copy for ChatGPT", dl:"Download dictionary", dlpdf:"Download anonymized PDF",
   t_pdf_making:"Building the PDF…", t_pdf_ok:"Anonymized PDF downloaded",
   t_pdf_err:"Error while creating the PDF",
+  col_title:"Sheet columns", col_mode_on:"decide per column",
+  col_head:"Column", col_shape:"Shape", col_distinct:"Distinct",
+  col_tag:"Recognized as", col_mode:"Treatment",
+  m_mask:"anonymize", m_keep:"leave in clear", m_year:"year only", m_empty:"blank it",
+  col_qi:"linkable", col_qi_t:"Few categories: harmless alone, but combined with other columns it can identify someone",
+  col_info:(sheet,rows,cols)=>sheet+" · "+rows+" rows · "+cols+" columns",
+  dlxlsx:"Download anonymized Excel", t_xlsx_making:"Building the Excel…",
+  t_xlsx_ok:"Anonymized Excel downloaded", t_xlsx_err:"Error while creating the Excel",
+  t_xlsx_warn:n=>"Excel downloaded · WARNING: "+n+" values may have been left in clear",
   t_pdf_warn:(r,s)=>"PDF downloaded · WARNING: "+(r+s)+" values were left in clear"
     +" ("+r+" not redacted, "+s+" too short to be searched safely): check the file"
     +" before sharing it",
@@ -1418,6 +1684,10 @@ const T = {
   r_title1:"Answer with placeholders", loaddict:"📁 Load dictionary",
   rin_ph:"Paste ChatGPT's answer here…",
   rev:"Restore values", r_title2:"Restored text",
+  rx_load:"📊 Load anonymized Excel", rx_go:"Download restored Excel",
+  t_rx_need:"Load the anonymized Excel (.xlsx) first", t_rx_making:"Restoring the Excel…",
+  t_rx_ok:"Restored Excel downloaded", t_rx_err:"Error while restoring the Excel",
+  t_rx_unknown:n=>"Excel restored · "+n+" placeholders are not in the dictionary and were left as they were",
   empty_rout:"The text with the real values will appear here.", rcopy:"Copy restored text",
   st_ent:"entities", st_uniq:"unique values", st_model:"from the model",
   st_regex:"from regex/checksum", st_chars:"characters", analyzing:"Analyzing…",
@@ -1428,7 +1698,7 @@ const T = {
   t_no_dict:"No dictionary: load a .json one", t_restored:"Values restored",
   t_nothing_copy:"Nothing to copy", t_restored_copied:"Restored text copied",
   t_dict_loaded:"Dictionary loaded", t_json_invalid:"Invalid JSON",
-  t_drag_pdf:"Unsupported format: use PDF, .md or .txt",
+  t_drag_pdf:"Unsupported format: use PDF, .xlsx, .md or .txt",
   pii_found:(n,u)=>n+" PII found · "+u+" unique values",
   dict_n:n=>n+" IDs in the dictionary",
   dict_loaded_n:n=>"dictionary loaded · "+n+" IDs",
@@ -1539,6 +1809,9 @@ function setSrcView(v){
 
 async function onFile(f){
   $('dropTxt').innerHTML='📎 <b>'+escapeHtml(f.name)+'</b>';
+  const xlsx=/\.xlsx$/i.test(f.name);
+  $('dlxlsx').style.display=xlsx?'':'none';   // solo per un Excel caricato
+  if(xlsx)loadColumns(f); else hideColumns();
   SRC_DOC=null;$('srcTabs').style.display='none';$('inHint').style.display='';
   setSrcView('text');
   if(!(f.type==='application/pdf'||/\.pdf$/i.test(f.name)))return;
@@ -1582,7 +1855,8 @@ async function run(){
     if(d.source_text&&file)$('src').value=d.source_text;
     DATA=d;off.clear();
     // senza dizionario non tocchiamo MAP ne' il localStorage: nessuna chiave nuova nasce
-    if(d.mapping_enabled!==false){MAP=d.mapping;localStorage.setItem('pii_map',JSON.stringify(MAP));}
+    if(d.mapping_enabled!==false){MAP=d.mapping;localStorage.setItem('pii_map',JSON.stringify(MAP));
+      MAP_TYPES={};localStorage.removeItem('pii_types');}
     render();
     toast(T[L].pii_found(d.n_entities,d.n_unique));
   }catch(e){toast(tt('t_error')+': '+e.message,false);}
@@ -1729,6 +2003,125 @@ $('dlpdf').onclick=async()=>{
   }finally{btn.disabled=false;btn.innerHTML=old;}
 };
 
+/* ---- Estrazione tabellare: profilo delle colonne e scelta per colonna.
+       Il profilo NON contiene valori del file, solo forme (AAAAAA99A99A999A). ---- */
+let COLPROF=null, TAB_ON=false;
+function hideColumns(){COLPROF=null;TAB_ON=false;$('colCard').style.display='none';}
+async function loadColumns(f){
+  hideColumns();
+  try{
+    const fd=new FormData();fd.append('file',f);
+    const r=await fetch('/xlsx/columns',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'');
+    COLPROF=d;
+    // tabellare per default solo se il file ne ha la forma; sempre disattivabile
+    TAB_ON=d.columns.length>=8&&d.rows>=20;
+    renderColumns();
+  }catch(e){hideColumns();}          // non e' un'estrazione: resta la via col modello
+}
+function renderColumns(){
+  const d=COLPROF;if(!d)return;
+  $('colCard').style.display='';
+  $('colToggle').checked=TAB_ON;
+  $('colInfo').textContent=T[L].col_info(d.sheet,d.rows,d.columns.length);
+  const tb=$('colrows');tb.innerHTML='';
+  for(const c of d.columns){
+    const tr=document.createElement('tr');
+    // textContent, mai innerHTML: le intestazioni vengono dal file dell'utente
+    const td=(txt,cls)=>{const e=document.createElement('td');if(cls)e.className=cls;
+      e.textContent=txt;tr.appendChild(e);return e;};
+    td(c.header||('#'+c.index),'k');
+    td(c.shape||'—','v');
+    td(String(c.distinct)+(c.distinct_capped?'+':''));
+    const tag=td(c.tag||'—');
+    if(c.reason)tag.title=c.reason;
+    if(c.quasi_identifier){const b=document.createElement('span');b.className='chip';
+      b.style.marginLeft='6px';b.textContent=tt('col_qi');b.title=tt('col_qi_t');tag.appendChild(b);}
+    const sel=document.createElement('select');sel.dataset.col=c.index;
+    for(const m of ['mask','keep','year','empty']){
+      const o=document.createElement('option');o.value=m;o.textContent=tt('m_'+m);
+      if(m===c.suggested_mode)o.selected=true;sel.appendChild(o);}
+    const ultima=document.createElement('td');ultima.appendChild(sel);tr.appendChild(ultima);
+    tb.appendChild(tr);
+  }
+}
+function colChoices(){
+  const out={};
+  for(const sel of document.querySelectorAll('#colrows select'))out[sel.dataset.col]=sel.value;
+  return out;
+}
+$('colToggle').onchange=e=>{TAB_ON=e.target.checked;};
+
+/* ---- Excel anonimizzato: lo stesso foglio caricato, con le celle anonimizzate e
+       formattazione/struttura intatte. Come /pdf, il dizionario non viene inviato:
+       il server lo ricostruisce e lo butta. ---- */
+$('dlxlsx').onclick=async()=>{
+  const file=$('pdf').files[0];
+  if(!file||!/\.xlsx$/i.test(file.name))return;
+  const btn=$('dlxlsx');btn.disabled=true;const old=btn.innerHTML;
+  btn.innerHTML='<span class="spin"></span> '+tt('t_xlsx_making');
+  try{
+    const fd=new FormData();fd.append('file',file);
+    // dizionario attivo: ci facciamo dare anche la chiave di ripristino (+ tipi delle celle)
+    if(MAPPING)fd.append('include_mapping','1');
+    let url='/xlsx';
+    if(TAB_ON&&COLPROF){                      // estrazione tabellare: si decide per colonna
+      url='/xlsx/columns/anonymize';
+      fd.append('columns',JSON.stringify(colChoices()));
+      if(COLPROF.sheet)fd.append('sheet',COLPROF.sheet);
+    }else if(TAGS_LOADED)fd.append('exclude_tags',[...EXCL].join(','));
+    const resp=await fetch(url,{method:'POST',body:fd});
+    if(!resp.ok){let m=tt('t_xlsx_err');try{m=(await resp.json()).error||m;}catch(_){}
+      toast(m,false);return;}
+    // residui = valori ancora leggibili; saltati = valori troppo corti per cercarli nel resto del file
+    let n;
+    if(MAPPING){
+      const d=await resp.json();
+      const bin=Uint8Array.from(atob(d.xlsx_base64),c=>c.charCodeAt(0));
+      saveBlob(new Blob([bin],{type:XLSX_MIME}),d.filename);
+      MAP=d.mapping;MAP_TYPES=d.types||{};
+      localStorage.setItem('pii_map',JSON.stringify(MAP));
+      localStorage.setItem('pii_types',JSON.stringify(MAP_TYPES));
+      $('dictInfo').textContent=T[L].dict_session(Object.keys(MAP).length);
+      // accanto al file: senza questo JSON, in un'altra sessione l'Excel non si ripristina
+      saveBlob(new Blob([JSON.stringify({...MAP,_types:MAP_TYPES},null,2)],{type:'application/json'}),
+        d.filename.replace(/_anonimizzato\.xlsx$/,'')+'_dizionario.json');
+      n=(d.residual||0)+(d.skipped||0)+(d.left||0);   // "left" = modalita' per colonna
+    }else{
+      const fn=/filename=([^;]+)/.exec(resp.headers.get('Content-Disposition')||'');
+      saveBlob(await resp.blob(),fn?fn[1]:'foglio_anonimizzato.xlsx');
+      n=(+resp.headers.get('X-PII-Residual')||0)+(+resp.headers.get('X-PII-Skipped')||0)
+        +(+resp.headers.get('X-PII-Left')||0);
+    }
+    if(n>0)toast(T[L].t_xlsx_warn(n),false,9000);else toast(tt('t_xlsx_ok'));
+  }catch(e){toast(tt('t_xlsx_err')+': '+e.message,false);}
+  finally{btn.disabled=false;btn.innerHTML=old;}
+};
+
+/* ---- Excel ripristinato: l'Excel anonimizzato (anche modificato da un LLM) +
+       il dizionario della sessione o caricato da file -> valori veri nelle celle ---- */
+$('rxlsx').onchange=e=>{const f=e.target.files[0];$('rxlsxName').textContent=f?f.name:'';};
+$('rxlsxgo').onclick=async()=>{
+  const file=$('rxlsx').files[0];
+  if(!file){toast(tt('t_rx_need'),false);return;}
+  if(!Object.keys(MAP).length){toast(tt('t_no_dict'),false);return;}
+  const btn=$('rxlsxgo');btn.disabled=true;const old=btn.innerHTML;
+  btn.innerHTML='<span class="spin"></span> '+tt('t_rx_making');
+  try{
+    const fd=new FormData();fd.append('file',file);
+    fd.append('mapping',JSON.stringify({...MAP,_types:MAP_TYPES}));
+    const resp=await fetch('/xlsx/restore',{method:'POST',body:fd});
+    if(!resp.ok){let m=tt('t_rx_err');try{m=(await resp.json()).error||m;}catch(_){}
+      toast(m,false);return;}
+    const fn=/filename=([^;]+)/.exec(resp.headers.get('Content-Disposition')||'');
+    saveBlob(await resp.blob(),fn?fn[1]:'foglio_ripristinato.xlsx');
+    const u=+resp.headers.get('X-PII-Unknown')||0;
+    if(u>0)toast(T[L].t_rx_unknown(u),false,9000);else toast(tt('t_rx_ok'));
+  }catch(e){toast(tt('t_rx_err')+': '+e.message,false);}
+  finally{btn.disabled=false;btn.innerHTML=old;}
+};
+
 /* ---- reverse ---- */
 function reverse(){
   const txt=$('rin').value;
@@ -1753,7 +2146,9 @@ $('rclear').onclick=()=>{$('rin').value='';$('rout').innerHTML=routEmpty();$('ro
 
 /* ---- carica dizionario da file (per sessioni diverse) ---- */
 $('dictFile').onchange=e=>{const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();r.onload=()=>{try{MAP=JSON.parse(r.result);
+  const r=new FileReader();r.onload=()=>{try{const o=JSON.parse(r.result);
+    MAP=phOnly(o);MAP_TYPES=(o&&typeof o._types==='object'&&o._types)||{};
+    localStorage.setItem('pii_types',JSON.stringify(MAP_TYPES));
     $('dictInfo').textContent=T[L].dict_loaded_n(Object.keys(MAP).length);
     toast(tt('t_dict_loaded'));}catch{toast(tt('t_json_invalid'),false);}};
   r.readAsText(f);};
@@ -1761,12 +2156,14 @@ $('dictFile').onchange=e=>{const f=e.target.files[0];if(!f)return;
 /* ---- input helpers ---- */
 $('go').onclick=run;
 $('clear').onclick=()=>{$('src').value='';$('pdf').value='';$('dropTxt').innerHTML=tt('drop');
+  $('dlxlsx').style.display='none';hideColumns();
   DATA=null;$('prev').style.display='none';$('emptyPrev').style.display='';
   $('anon').value='';$('meta').innerHTML='';$('legend').innerHTML='';
   $('dictCard').style.display='none';$('ulock').textContent='';
   // la card era solo nascosta: senza queste tre righe il dizionario resta in MAP e su
   // disco, e al riavvio ricompare zitto al posto di quello del documento nuovo
   MAP={};localStorage.removeItem('pii_map');$('dictInfo').textContent='';
+  MAP_TYPES={};localStorage.removeItem('pii_types');
   SRC_DOC=null;OUT_DOC=null;$('pdfSrcView').innerHTML='';$('pdfOutView').innerHTML='';
   $('srcTabs').style.display='none';$('inHint').innerHTML=tt('in_hint');
   $('inHint').style.display='';setSrcView('text');setView('prev');
@@ -1778,7 +2175,7 @@ const drop=$('drop');
 $('pdf').onchange=e=>{const f=e.target.files[0];if(f)onFile(f);};
 ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hot');}));
 ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hot');}));
-const OK_EXT=/\.(pdf|md|markdown|txt|text)$/i;
+const OK_EXT=/\.(pdf|xlsx|md|markdown|txt|text)$/i;
 drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];
   if(f&&(f.type==='application/pdf'||OK_EXT.test(f.name))){
     const dt=new DataTransfer();dt.items.add(f);$('pdf').files=dt.files;
@@ -1905,6 +2302,7 @@ async function saveTags(){
 loadTags();
 
 /* recupera dizionario da sessione precedente (dopo applyLang -> testo nella lingua giusta) */
+try{MAP_TYPES=JSON.parse(localStorage.getItem('pii_types')||'{}')||{};}catch{}
 try{const m=localStorage.getItem('pii_map');if(m){MAP=JSON.parse(m);
   if(Object.keys(MAP).length)$('dictInfo').textContent=T[L].dict_session(Object.keys(MAP).length);}}catch{}
 </script>

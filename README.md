@@ -458,8 +458,11 @@ The same process is a plain HTTP service, so you can use it as a sidecar in a fa
 curl localhost:5005/health                      # readiness, no inference: 200 = model loaded
 curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
      -d '{"text": "Mario Rossi, IBAN IT60X0542811101000000123456"}'
-curl -F "file=@atto.pdf" localhost:5005/analyze  # .pdf, .md, .txt
+curl -F "file=@atto.pdf" localhost:5005/analyze  # .pdf, .xlsx, .md, .txt
 curl -F "file=@atto.pdf" localhost:5005/pdf -o atto_anonimizzato.pdf   # anonymized PDF back
+curl -F "file=@dipendenti.xlsx" localhost:5005/xlsx -o dipendenti_anonimizzato.xlsx   # anonymized Excel back
+curl -F "file=@dipendenti_anonimizzato.xlsx" -F "dictionary=@dipendenti_dizionario.json" \
+     localhost:5005/xlsx/restore -o dipendenti_ripristinato.xlsx                     # real values back
 curl localhost:5005/settings                     # tag legend, excluded tags, dictionary state
 ```
 
@@ -482,6 +485,57 @@ Metadata, XMP, annotations, form-field values and bookmark titles are scrubbed t
 attachments are dropped. Text baked into a raster image cannot be redacted at all — if **no**
 occurrence is found anywhere in the PDF the endpoint fails with `422` rather than handing you a file
 that only looks anonymized.
+
+### Excel spreadsheets
+
+Upload an `.xlsx` and `POST /xlsx` (button `Scarica Excel anonimizzato`) gives you back **the same
+workbook** with the PII replaced cell by cell: formatting, column widths, merged cells and the type of
+every untouched cell survive — a number stays a number, only a cell that held PII becomes text.
+
+The whole workbook is laid out as one tab-separated text (one line per row, every sheet, hidden ones
+included) and analyzed in **one** pass, so the model sees each row as context and the numbering is
+consistent across sheets: the same person is `[FULLNAME_3]` everywhere. Every dictionary value is then
+searched in the rest of the file, whole words only and never across two cells, so a name the model
+caught on row 2 is replaced on row 40 too.
+
+Beyond cell values it rewrites string literals inside formulas, comments (and their author), print
+headers/footers and sheet names; it drops hyperlinks pointing at a found value, document properties,
+external links and **pivot tables** — their cache is a full hidden copy of the source data. openpyxl
+does not keep charts and images of a loaded file, so the output has none. The file is re-read at the
+end and the same `X-PII-Residual`/`X-PII-Skipped` warnings apply (e.g. PII inside a data-validation
+list, which is not rewritten). Legacy `.xls` is not supported: save it as `.xlsx` first.
+
+**Restoring the Excel.** With the reversible dictionary on, the download comes with
+`<name>_dizionario.json` (`POST /xlsx` with `include_mapping=1` answers JSON: the file in base64,
+the dictionary and the original type of every cell that was entirely a number or a date). In the
+`Ripristina` tab, load the anonymized `.xlsx` — even one an LLM has edited in the meantime, new rows
+and columns included — and `POST /xlsx/restore` puts the real values back in cells, formulas,
+comments, headers and sheet names, turning numbers and dates back into numbers and dates. It is as
+tolerant as the text restore (`[ FULLNAME_1 ]`, `FULLNAME_1`); placeholders the dictionary does not
+know stay as they are and are counted in `X-PII-Unknown`. No inference is involved. Two honest limits:
+the dictionary keeps one spelling per value (`Rossi` and `ROSSI` come back the same), and what
+anonymization removed (authors, hyperlinks, pivots) does not come back.
+
+### Tabular extractions: decide per column, not per cell
+
+A management-system export — dozens of columns, every cell a bare number — is not prose, and the
+model is trained on prose: a five-digit code looks like a document number, an amount or a house
+number, so a 62-column file comes back masked almost everywhere and useless for analysis. In a table
+the information is already in the schema: **the column says what the value is**. So drop an `.xlsx`
+and a `Colonne del foglio` panel appears (`POST /xlsx/columns`): for each column you get its type,
+distinct values, **shape** (`AAAAAA99A99A999A` — never the values themselves) and a proposed
+treatment, inferred from the column name *and* from the values, run through the same regex+checksum
+net the model is paired with (a CF/PIVA/IBAN column is recognized even when it is called `avg(0)`).
+
+You then choose per column — `anonymize` (reversible placeholder), `year only` (a date becomes its
+year: analysis by age survives, the exact date does not), `blank it`, `leave in clear` — and
+`POST /xlsx/columns/anonymize` does the rest. No inference at all: seconds instead of hours, the cost
+does not grow with the number of rows, and not one false positive on the measure columns. The
+dictionary is the same format, so `/xlsx/restore` restores these files too.
+
+Columns with **few distinct values** are flagged `incrociabile` (linkable): province, sex, tax
+regime and the like identify nobody on their own, but combined they can single out a rare case. This
+is pseudonymization, not anonymization — keep the dictionary as carefully as the original file.
 
 ### See the document, not just its text
 
