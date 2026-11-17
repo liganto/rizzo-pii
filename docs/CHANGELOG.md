@@ -5,6 +5,17 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-11-17 — Telefono: prefisso `0039` e cifre a gruppi (`detectors.py`)
+
+La regex del telefono riconosceva il prefisso solo come `+39` e il cellulare solo nella
+forma 3-3-4. Nei messaggi e negli export dei gestionali si trovano spesso `0039…` e le
+sette cifre finali a gruppi di due o tre ("351 67 80 083"): su 60 cellulari di prova in
+stile chat ne restavano in chiaro 18. Ora il prefisso è `+39` o `0039` e le sette cifre
+finali accettano un separatore singolo fra una cifra e l'altra. Casi nuovi in
+`tests/test_detector_formats.py`; nessun cambiamento sui negativi esistenti (date, richiami).
+
+---
+
 ## 2026-10-22 — Il PDF protetto da password si riconosce già al caricamento (`app.py`)
 
 Completa la voce del 2026-09-25: lì il server rispondeva già col messaggio chiaro, ma

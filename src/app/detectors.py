@@ -131,8 +131,12 @@ DETECTORS = [
      piva_ok, True),
     # Telefono: al gruppo dei separatori si aggiunge il trattino, usatissimo sia
     # sul cellulare ("333-123-4567") sia sul fisso ("010-2471234").
+    # Prefisso internazionale anche nella forma "0039" (comune nei messaggi e nei
+    # gestionali). Il cellulare accetta le sette cifre finali in gruppi qualsiasi
+    # ("351 67 80 083", "333 12 34 567"): un separatore singolo fra una cifra e
+    # l'altra, mai due, cosi' due numeri vicini non si fondono in uno.
     ("TELEPHONENUM",
-     re.compile(r"(?<![\w.])(?:\+39[\s.\-]?)?(?:3\d{2}[\s.\-]?\d{3}[\s.\-]?\d{3,4}"
+     re.compile(r"(?<![\w.+])(?:(?:\+|00)39[\s.\-]?)?(?:3\d{2}(?:[\s.\-]?\d){6,7}"
                 r"|0\d{1,3}[\s.\-]?\d{5,8})(?![\w])"),
      None, True),
     ("AMOUNT",
