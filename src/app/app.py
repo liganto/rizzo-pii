@@ -26,13 +26,24 @@ pagine vengono coperte SUI PIXEL (pdf_export._redact_scanned_page).
 
 Endpoint HTTP:
   GET  /health    liveness/readiness senza inference (200 = modello caricato, 503 = no)
-  POST /analyze   {"text": ...} oppure multipart con un file (.pdf/.md/.txt/immagine) o
+  POST /analyze   {"text": ...} oppure multipart con un file (.pdf/.xlsx/.md/.txt/immagine) o
                   con "doc_id" (documento gia' caricato con /preview); campi opzionali
                   "exclude_tags", "include_mapping", "ocr" (auto|force|off), "ocr_preset"
   POST /ocr       OCR di un PDF o di un'immagine (file o doc_id): testo Markdown per
                   pagina, opz. righe con box ("lines=1") e avanzamento NDJSON ("stream=1")
   POST /pdf       stesso input di /analyze -> scarica il PDF ANONIMIZZATO (redazione
                   vera del PDF caricato, oppure PDF ricostruito dal testo)
+  POST /xlsx      multipart con un .xlsx -> scarica lo stesso foglio con le celle
+                  ANONIMIZZATE (formattazione e struttura intatte, vedi xlsx_export.py);
+                  con include_mapping=1 risponde JSON {xlsx_base64, mapping, types, ...}
+  POST /xlsx/restore  multipart: .xlsx anonimizzato + dizionario (file "dictionary" o
+                  campo "mapping") -> scarica l'Excel con i valori veri RIPRISTINATI
+  POST /xlsx/columns  multipart con un .xlsx -> PROFILO delle colonne (tipo, distinti,
+                  forma, tag proposto): per le ESTRAZIONI TABELLARI, dove si decide per
+                  colonna invece di far indovinare il modello cella per cella
+  POST /xlsx/columns/anonymize  multipart: .xlsx + "columns" = JSON
+                  {intestazione: "mask"|"year"|"empty"|"keep"} -> Excel anonimizzato
+                  (o JSON con dizionario, come /xlsx, se include_mapping=1)
   POST /preview   multipart con un .pdf -> lo tiene in memoria per l'ANTEPRIMA a video e
                   ritorna {doc_id, n_pages, text}
   POST /pdf/preview  come /pdf, ma invece del binario ritorna {doc_id, n_pages, ...}:
@@ -52,6 +63,7 @@ Preferenze di anonimizzazione (precedenza): campo nella richiesta > CLI --exclud
   --no-mapping > env PII_EXCLUDE_TAGS/PII_MAPPING > prefs.json > default
 """
 
+import base64
 import bisect
 import json
 import os
@@ -70,6 +82,8 @@ import ocr
 import pdf_export
 import pdf_text
 import server_config
+import tabular
+import xlsx_export
 # Rete REGEX + CHECKSUM: modulo a parte, senza dipendenze dal modello. I nomi
 # restano importabili da qui (`app.detect_regex`) per non rompere chi li usa.
 from detectors import (DETECTORS, SOFT_REGEX_LABELS, cf_ok,  # noqa: F401
@@ -169,8 +183,10 @@ print(f"Modello pronto ({MODEL_BACKEND}).")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# Estensioni accettate dall'upload (il PDF passa da PyMuPDF, il resto e' testo puro).
+# Estensioni accettate dall'upload (il PDF passa da PyMuPDF, l'Excel da openpyxl,
+# il resto e' testo puro).
 TEXT_EXTS = {".md", ".markdown", ".txt", ".text"}
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # --------------------------------------------------------------------------- #
 # Anteprima a video dei PDF (documento caricato a sinistra, anonimizzato a destra)
@@ -560,8 +576,13 @@ def _is_pdf(name, data):
     return os.path.splitext((name or "").lower())[1] == ".pdf" or data[:5] == b"%PDF-"
 
 
+def _is_xlsx(name):
+    return os.path.splitext((name or "").lower())[1] == ".xlsx"
+
+
 def _text_from_bytes(name, data):
-    """Testo dai bytes di un upload: PDF via PyMuPDF, .md/.txt come testo puro.
+    """Testo dai bytes di un upload: PDF via PyMuPDF, .xlsx steso in righe con le
+    celle separate da TAB (xlsx_export), .md/.txt come testo puro.
 
     Per i PDF non basta `page.get_text()`: nei moduli AcroForm il valore sta
     nei widget (issue #85). `pdf_text.collect_readable_text` allinea
@@ -579,6 +600,11 @@ def _text_from_bytes(name, data):
             # Non solo page.get_text(): nei PDF fillable il valore sta nei
             # widget AcroForm (issue #85). Stesso contratto di pdf_export.
             return pdf_text.collect_readable_text(doc)
+    if _is_xlsx(name):
+        return xlsx_export.workbook_text(data)       # XlsxError e' un ValueError
+    if ext in (".xls", ".xlsm", ".xlsb", ".ods"):
+        raise ValueError(f"Formato {ext} non supportato: salva il foglio come .xlsx "
+                         "(Excel: File > Salva con nome) e ricaricalo.")
     if ext in TEXT_EXTS or not ext:
         # utf-16 solo col BOM: senza, il codec accetta qualunque sequenza di lunghezza pari
         # e si mangia i .txt a 8 bit. cp1252 prima di latin-1: e' quello che scrivono Word
@@ -599,7 +625,7 @@ def _text_from_bytes(name, data):
                 continue
     raise ValueError(
         f"Formato non supportato: {ext or name or 'sconosciuto'}. "
-        "Accetto .pdf, .md, .txt oppure testo incollato."
+        "Accetto .pdf, .xlsx, .md, .txt oppure testo incollato."
     )
 
 
@@ -908,6 +934,175 @@ def pdf_preview_route():
         "ocr_pages": [i + 1 for i in report.get("ocr_pages", [])],
         "seals": report.get("seals", 0),
     })
+
+
+# --------------------------------------------------------------------------- #
+# Excel anonimizzato da scaricare
+# --------------------------------------------------------------------------- #
+@app.route("/xlsx", methods=["POST"])
+def xlsx_route():
+    """Scarica il foglio Excel ANONIMIZZATO. Multipart con un .xlsx (stesso campo
+    "pdf"/"file" di /analyze) e campo opzionale "exclude_tags".
+
+    Il workbook viene steso in un testo solo (una riga per riga, celle separate da
+    TAB), analizzato con UNA chiamata ad analyze() e ricostruito cella per cella:
+    formattazione, tipi e struttura restano, cambiano solo i valori (vedi
+    xlsx_export.py). Come per /pdf il dizionario non viaggia sulla rete: serve a
+    propagare i valori nel resto del file e muore con la richiesta."""
+    up = _uploaded_file()
+    if up is None:
+        return jsonify({"error": "Nessun file Excel caricato."}), 400
+    name, data = up.filename, up.read()
+    if not _is_xlsx(name):
+        return jsonify({"error": "Serve un file .xlsx."}), 400
+    try:
+        layout = xlsx_export.read_workbook(data)
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+    text = layout.text                               # NON strip(): gli offset contano
+    if not text.strip():
+        return jsonify({"error": "Il foglio e' vuoto."}), 400
+
+    raw_excl = request.form.get("exclude_tags")
+    excl = server_config.parse_tag_list(raw_excl) if raw_excl is not None else EXCLUDED_TAGS
+    res = analyze(text, excl, mapping_enabled=True)  # interno: la mappa non esce da qui
+    if not res["mapping"]:
+        return jsonify({"error": "Nessuna PII trovata: non c'e' niente da "
+                                 "anonimizzare in questo foglio."}), 422
+    out, report = xlsx_export.write_workbook(
+        layout, xlsx_export.spans_from_segments(res["segments"]), res["mapping"])
+
+    stem = os.path.splitext(_safe_name(name, "foglio.xlsx"))[0] or "foglio"
+    out_name = f"{stem}_anonimizzato.xlsx"
+    # Con include_mapping il client chiede ESPLICITAMENTE la chiave di ripristino
+    # (come fa /analyze): JSON con il file in base64 + dizionario + tipi delle celle.
+    # Senza, la risposta resta il binario e la mappa muore qui.
+    raw_map = request.form.get("include_mapping")
+    if raw_map is not None and server_config.parse_bool(raw_map, False):
+        return jsonify({
+            "filename": out_name,
+            "xlsx_base64": base64.b64encode(out).decode("ascii"),
+            "mapping": res["mapping"],
+            "types": report["types"],
+            "redactions": report["occurrences"],
+            "residual": len(report["residual"]),
+            "skipped": len(report["skipped"]),
+        })
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={out_name}"
+    resp.headers["X-PII-Redactions"] = str(report["occurrences"])
+    resp.headers["X-PII-Residual"] = str(len(report["residual"]))
+    resp.headers["X-PII-Skipped"] = str(len(report["skipped"]))
+    return resp
+
+
+@app.route("/xlsx/columns", methods=["POST"])
+def xlsx_columns_route():
+    """Profilo delle colonne di un'estrazione tabellare: tipo, valori distinti, forma
+    (lettere -> A, cifre -> 9) e tag proposto, dedotto dal nome della colonna e dai
+    valori passati alla rete regex+checksum. Nessuna inferenza del modello e NESSUN
+    valore reale nella risposta: solo forme. Campi opzionali "sheet" e "header_row"."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica un file .xlsx."}), 400
+    try:
+        head_row = int(request.form.get("header_row") or 1)
+        prof = tabular.profile(up.read(), request.form.get("sheet") or None, head_row)
+    except (ValueError, xlsx_export.XlsxError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(prof)
+
+
+@app.route("/xlsx/columns/anonymize", methods=["POST"])
+def xlsx_columns_anonymize_route():
+    """Anonimizzazione PER COLONNA (vedi tabular.py): niente modello, niente falsi
+    positivi sulle colonne di misura, e il tempo non dipende dal numero di righe.
+
+    Multipart: il .xlsx + "columns" = JSON {intestazione: "mask"|"year"|"empty"|"keep"}.
+    Come /xlsx: risposta binaria, oppure JSON con {xlsx_base64, mapping, types} se
+    include_mapping=1. Il dizionario e' quello di xlsx_export, quindi si ripristina
+    con /xlsx/restore."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica un file .xlsx."}), 400
+    raw = request.form.get("columns") or ""
+    if not raw:
+        return jsonify({"error": "Manca la scelta delle colonne (campo \"columns\")."}), 400
+    try:
+        scelte = json.loads(raw)
+        if not isinstance(scelte, dict):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        return jsonify({"error": "Campo \"columns\" non valido: serve un oggetto JSON "
+                                 "{intestazione: modalita'}."}), 400
+    try:
+        head_row = int(request.form.get("header_row") or 1)
+        out, report = tabular.anonymize(up.read(), scelte,
+                                        request.form.get("sheet") or None, head_row)
+    except (ValueError, xlsx_export.XlsxError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not report["cells"]:
+        return jsonify({"error": "Nessuna cella da anonimizzare: controlla le colonne "
+                                 "scelte."}), 422
+
+    stem = os.path.splitext(_safe_name(up.filename, "foglio.xlsx"))[0] or "foglio"
+    out_name = f"{stem}_anonimizzato.xlsx"
+    raw_map = request.form.get("include_mapping")
+    if raw_map is not None and server_config.parse_bool(raw_map, False):
+        return jsonify({
+            "filename": out_name,
+            "xlsx_base64": base64.b64encode(out).decode("ascii"),
+            "mapping": report["mapping"],
+            "types": report["types"],
+            "columns": report["columns"],
+            "ignored": report["ignored"],
+            "cells": report["cells"],
+            "left": report["left"],
+        })
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={out_name}"
+    resp.headers["X-PII-Redactions"] = str(report["cells"])
+    resp.headers["X-PII-Left"] = str(report["left"])
+    return resp
+
+
+@app.route("/xlsx/restore", methods=["POST"])
+def xlsx_restore_route():
+    """Rimette i valori veri in un Excel anonimizzato, anche se nel frattempo e' stato
+    modificato (righe o colonne aggiunte da un LLM). Multipart: il .xlsx (campo
+    "file"/"pdf") + il dizionario, come file JSON nel campo "dictionary" oppure come
+    testo JSON nel campo "mapping". Formato = quello che scarica l'UI:
+    {placeholder: valore} piu' la chiave facoltativa "_types" per ridare a numeri e
+    date il loro tipo. Nessuna inferenza: funziona anche col modello non caricato."""
+    up = _uploaded_file()
+    if up is None or not _is_xlsx(up.filename):
+        return jsonify({"error": "Carica il file .xlsx anonimizzato."}), 400
+    if "dictionary" in request.files:
+        raw = request.files["dictionary"].read()
+    else:
+        raw = request.form.get("mapping") or ""
+    if not raw:
+        return jsonify({"error": "Manca il dizionario: carica il file JSON scaricato "
+                                 "insieme all'Excel anonimizzato."}), 400
+    try:
+        mapping, types = xlsx_export.parse_dictionary(json.loads(raw))
+    except json.JSONDecodeError:
+        return jsonify({"error": "Dizionario non valido: serve il file JSON scaricato "
+                                 "insieme all'Excel anonimizzato."}), 400
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        out, report = xlsx_export.restore_workbook(up.read(), mapping, types)
+    except xlsx_export.XlsxError as e:
+        return jsonify({"error": str(e)}), 400
+
+    stem = os.path.splitext(_safe_name(up.filename, "foglio.xlsx"))[0] or "foglio"
+    stem = re.sub(r"_anonimizzato$", "", stem)
+    resp = app.response_class(out, mimetype=XLSX_MIME)
+    resp.headers["Content-Disposition"] = f"attachment; filename={stem}_ripristinato.xlsx"
+    resp.headers["X-PII-Restored"] = str(report["restored"])
+    resp.headers["X-PII-Unknown"] = str(len(report["unknown"]))
+    return resp
 
 
 # --------------------------------------------------------------------------- #

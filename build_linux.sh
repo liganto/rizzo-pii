@@ -37,7 +37,7 @@ if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --upgrade pip
   "$VENV/bin/pip" install --index-url https://download.pytorch.org/whl/cpu torch
-  "$VENV/bin/pip" install "transformers==4.57.3" tokenizers safetensors flask pymupdf pyinstaller onnx onnxruntime \
+  "$VENV/bin/pip" install "transformers==4.57.3" tokenizers safetensors flask pymupdf openpyxl pyinstaller onnx onnxruntime \
     opencv-python-headless pyclipper pyyaml
 fi
 "$VENV/bin/python" -c "import onnxruntime" 2>/dev/null || "$VENV/bin/pip" install onnx onnxruntime

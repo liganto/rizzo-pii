@@ -445,7 +445,7 @@ try{const t=localStorage.getItem('pii_theme');if(t==='dark'||t==='light')documen
               <button id="sText" onclick="setSrcView('text')"><span data-i18n="v_raw">Testo</span></button>
             </div>
             <label class="btn quiet" id="pickBtn" data-i18n-title="t_pick" title="Carica un file"><svg class="i"><use href="#i-upload"/></svg><span data-i18n="pick">Carica</span>
-              <input type="file" id="pdf" hidden accept=".pdf,.png,.jpg,.jpeg,.jfif,.tif,.tiff,.bmp,.webp,.gif,.md,.markdown,.txt,application/pdf,image/*,text/markdown,text/plain"></label>
+              <input type="file" id="pdf" hidden accept=".pdf,.png,.jpg,.jpeg,.jfif,.tif,.tiff,.bmp,.webp,.gif,.xlsx,.md,.markdown,.txt,application/pdf,image/*,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/markdown,text/plain"></label>
           </div>
         </div>
         <div class="bd">
@@ -466,7 +466,7 @@ try{const t=localStorage.getItem('pii_theme');if(t==='dark'||t==='light')documen
               <img src="/assets/mascot_doc.png" alt="" onerror="this.remove()">
               <div class="t1" data-i18n="dz_title">Trascina qui un documento</div>
               <div class="t2" data-i18n="dz_sub">PDF, scansioni e foto vengono lette in locale, con l'OCR quando serve. Oppure incolla il testo.</div>
-              <div class="fmts"><span class="badge">PDF</span><span class="badge">PNG · JPG · TIFF</span><span class="badge">.md · .txt</span></div>
+              <div class="fmts"><span class="badge">PDF</span><span class="badge">PNG · JPG · TIFF</span><span class="badge">.xlsx</span><span class="badge">.md · .txt</span></div>
               <label class="btn ghost" for="pdf"><svg class="i"><use href="#i-upload"/></svg><span data-i18n="choose">Scegli un file</span></label>
             </div>
           </div>
@@ -512,11 +512,45 @@ try{const t=localStorage.getItem('pii_theme');if(t==='dark'||t==='light')documen
         <div class="ft">
           <button class="btn primary" id="copy"><svg class="i"><use href="#i-copy"/></svg><span data-i18n="copy">Copia per ChatGPT</span></button>
           <button class="btn ghost" id="dlpdf"><svg class="i"><use href="#i-download"/></svg><span data-i18n="dlpdf">PDF anonimizzato</span></button>
+          <button class="btn ghost" id="dlxlsx" hidden><svg class="i"><use href="#i-download"/></svg><span data-i18n="dlxlsx">Excel anonimizzato</span></button>
           <button class="btn ghost" id="dl"><svg class="i"><use href="#i-book"/></svg><span data-i18n="dl">Dizionario</span></button>
           <span class="hint grow" id="ulock" style="text-align:right"></span>
         </div>
       </article>
     </div>
+
+    <!-- ESTRAZIONE TABELLARE: si decide per colonna invece di far indovinare il
+         modello cella per cella (vedi tabular.py). Compare caricando un .xlsx. -->
+    <section class="card dict" id="colCard" hidden>
+      <div class="hd">
+        <h2><svg class="i sm"><use href="#i-sliders"/></svg><span data-i18n="col_title">Colonne del foglio</span></h2>
+        <div class="right">
+          <label class="chip" style="cursor:pointer"><input type="checkbox" id="colToggle" checked>
+            <span data-i18n="col_mode_on">decidi per colonna</span></label>
+          <span class="hint" id="colInfo"></span>
+        </div>
+      </div>
+      <div class="bd">
+        <div class="callout info"><svg class="i"><use href="#i-info"/></svg>
+          <div data-i18n="col_hint">Su un'estrazione tabellare il modello sbaglia: un codice a cinque
+          cifre somiglia a un documento o a un importo. Qui decidi <b>una volta per colonna</b>:
+          la proposta viene dal nome della colonna e dai valori (con i checksum di CF, IVA e IBAN).
+          È immediato e non tocca le colonne di misura.</div>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th data-i18n="col_head">Colonna</th>
+              <th data-i18n="col_shape">Forma</th>
+              <th data-i18n="col_distinct">Distinti</th>
+              <th data-i18n="col_tag">Riconosciuta come</th>
+              <th data-i18n="col_mode">Trattamento</th>
+            </tr></thead>
+            <tbody id="colrows"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
 
     <!-- riepilogo + dizionario: sotto le due colonne, a tutta larghezza -->
     <section class="card dict" id="dictCard" hidden>
@@ -558,6 +592,13 @@ try{const t=localStorage.getItem('pii_theme');if(t==='dark'||t==='light')documen
           <span class="hint grow" id="dictInfo"></span>
           <button class="btn quiet" id="rclear"><svg class="i sm"><use href="#i-trash"/></svg><span data-i18n="clear">Pulisci</span></button>
           <button class="btn primary lg" id="rev"><svg class="i"><use href="#i-undo"/></svg><span data-i18n="rev">Ripristina valori</span></button>
+        </div>
+        <!-- Excel: stesso dizionario, ma sul file anonimizzato (anche modificato da un LLM) -->
+        <div class="ft">
+          <label class="btn ghost"><svg class="i sm"><use href="#i-upload"/></svg><span data-i18n="rx_load">Carica Excel anonimizzato</span>
+            <input type="file" id="rxlsx" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden></label>
+          <span class="hint grow" id="rxlsxName"></span>
+          <button class="btn primary" id="rxlsxgo"><svg class="i"><use href="#i-undo"/></svg><span data-i18n="rx_go">Scarica Excel ripristinato</span></button>
         </div>
       </article>
       <article class="card">
@@ -646,6 +687,12 @@ try{const t=localStorage.getItem('pii_theme');if(t==='dark'||t==='light')documen
 const $ = id => document.getElementById(id);
 let DATA = null;            // ultimo risultato di /analyze
 let MAP = {};               // {placeholder -> valore} della sessione corrente
+let MAP_TYPES = {};         // {placeholder -> "int"|"datetime"|...}: tipo delle celle Excel intere
+let COLPROF = null;         // profilo delle colonne dell'.xlsx caricato (/xlsx/columns)
+let TAB_ON = false;         // Excel: anonimizzazione per colonna invece che col modello
+const XLSX_MIME='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+function saveBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 const off = new Set();      // tag nascosti nell'anteprima evidenziata
 let L = 'it';               // lingua dell'UI
 let TAGS = [];              // legenda dei tag (da /settings)
@@ -686,6 +733,16 @@ const T = {
   copy:"Copia per ChatGPT", dl:"Dizionario", dlpdf:"PDF anonimizzato",
   t_pdf_making:"Genero il PDF…", t_pdf_ok:"PDF anonimizzato scaricato",
   t_pdf_err:"Errore nella creazione del PDF",
+  col_title:"Colonne del foglio", col_mode_on:"decidi per colonna",
+  col_hint:"Su un'estrazione tabellare il modello sbaglia: un codice a cinque cifre somiglia a un documento o a un importo. Qui decidi <b>una volta per colonna</b>: la proposta viene dal nome della colonna e dai valori (con i checksum di CF, IVA e IBAN). È immediato e non tocca le colonne di misura.",
+  col_head:"Colonna", col_shape:"Forma", col_distinct:"Distinti",
+  col_tag:"Riconosciuta come", col_mode:"Trattamento",
+  m_mask:"anonimizza", m_keep:"lascia in chiaro", m_year:"solo l'anno", m_empty:"svuota",
+  col_qi:"incrociabile", col_qi_t:"Poche categorie: da sola non identifica, ma incrociata con le altre colonne può farlo",
+  col_info:(foglio,righe,colonne)=>foglio+" · "+righe+" righe · "+colonne+" colonne",
+  dlxlsx:"Excel anonimizzato", t_xlsx_making:"Genero l'Excel…",
+  t_xlsx_ok:"Excel anonimizzato scaricato", t_xlsx_err:"Errore nella creazione dell'Excel",
+  t_xlsx_warn:n=>"Excel scaricato · ATTENZIONE: "+n+" valori potrebbero essere rimasti in chiaro",
   t_pdf_warn:(r,s)=>"Attenzione: "+(r+s)+" valori sono rimasti in chiaro ("+r+" non redatti, "+s+" troppo corti per essere cercati). Controlla il file prima di condividerlo.",
   dict_title:"Riepilogo e dizionario", dict_hint:"resta solo qui, in locale",
   th_id:"ID", th_val:"Valore originale", th_type:"Tipo",
@@ -693,6 +750,10 @@ const T = {
   r_title1:"Risposta con i placeholder", loaddict:"Carica dizionario",
   rin_ph:"Incolla qui la risposta di ChatGPT…",
   rev:"Ripristina valori", r_title2:"Testo ripristinato",
+  rx_load:"Carica Excel anonimizzato", rx_go:"Scarica Excel ripristinato",
+  t_rx_need:"Carica prima l'Excel anonimizzato (.xlsx)", t_rx_making:"Ripristino l'Excel…",
+  t_rx_ok:"Excel ripristinato scaricato", t_rx_err:"Errore nel ripristino dell'Excel",
+  t_rx_unknown:n=>"Excel ripristinato · "+n+" placeholder non sono nel dizionario e sono rimasti com'erano",
   empty_rout:"Il testo con i valori reali apparirà qui.", rcopy:"Copia testo ripristinato",
   st_ent:"entità", st_uniq:"valori unici", st_model:"dal modello",
   st_regex:"da regex/checksum", st_chars:"caratteri", st_ocr:"pagine lette con OCR",
@@ -704,7 +765,7 @@ const T = {
   t_no_dict:"Nessun dizionario: caricane uno .json", t_restored:"Valori ripristinati",
   t_nothing_copy:"Niente da copiare", t_restored_copied:"Testo ripristinato copiato",
   t_dict_loaded:"Dizionario caricato", t_json_invalid:"JSON non valido",
-  t_drag_pdf:"Formato non supportato: usa PDF, immagini (PNG, JPG, TIFF), .md o .txt",
+  t_drag_pdf:"Formato non supportato: usa PDF, immagini (PNG, JPG, TIFF), .xlsx, .md o .txt",
   t_text_loaded:"Testo caricato",
   pii_found:(n,u)=>n+" PII trovate · "+u+" valori unici",
   dict_n:n=>n+" ID nel dizionario",
@@ -712,7 +773,7 @@ const T = {
   dict_session:n=>"dizionario sessione · "+n+" ID",
   chars:n=>n.toLocaleString('it'),
   pages:n=>n+(n===1?" pagina":" pagine"),
-  k_pdf:"PDF", k_image:"Immagine", k_text:"Testo",
+  k_pdf:"PDF", k_image:"Immagine", k_text:"Testo", k_xlsx:"Excel",
   ocr_native:"testo nativo", ocr_running:(d,t)=>"OCR "+d+"/"+t+"…", ocr_starting:"avvio OCR…",
   ocr_done:(n,s)=>"OCR · "+n+(n===1?" pagina":" pagine")+" · "+s+" s",
   ocr_err:"OCR non riuscito", ocr_missing_b:"OCR non disponibile",
@@ -779,6 +840,16 @@ const T = {
   copy:"Copy for ChatGPT", dl:"Dictionary", dlpdf:"Anonymized PDF",
   t_pdf_making:"Building the PDF…", t_pdf_ok:"Anonymized PDF downloaded",
   t_pdf_err:"Error while creating the PDF",
+  col_title:"Sheet columns", col_mode_on:"decide per column",
+  col_hint:"On a tabular extraction the model gets it wrong: a five-digit code looks like a document number or an amount. Here you decide <b>once per column</b>: the proposal comes from the column name and from the values (with the CF, VAT and IBAN checksums). It is instant and leaves the measure columns alone.",
+  col_head:"Column", col_shape:"Shape", col_distinct:"Distinct",
+  col_tag:"Recognized as", col_mode:"Treatment",
+  m_mask:"anonymize", m_keep:"leave in clear", m_year:"year only", m_empty:"blank it",
+  col_qi:"linkable", col_qi_t:"Few categories: harmless alone, but combined with other columns it can identify someone",
+  col_info:(sheet,rows,cols)=>sheet+" · "+rows+" rows · "+cols+" columns",
+  dlxlsx:"Anonymized Excel", t_xlsx_making:"Building the Excel…",
+  t_xlsx_ok:"Anonymized Excel downloaded", t_xlsx_err:"Error while creating the Excel",
+  t_xlsx_warn:n=>"Excel downloaded · WARNING: "+n+" values may have been left in clear",
   t_pdf_warn:(r,s)=>"Warning: "+(r+s)+" values were left in clear ("+r+" not redacted, "+s+" too short to be searched safely). Check the file before sharing it.",
   dict_title:"Summary and dictionary", dict_hint:"stays here only, locally",
   th_id:"ID", th_val:"Original value", th_type:"Type",
@@ -786,6 +857,10 @@ const T = {
   r_title1:"Answer with placeholders", loaddict:"Load dictionary",
   rin_ph:"Paste ChatGPT's answer here…",
   rev:"Restore values", r_title2:"Restored text",
+  rx_load:"Load anonymized Excel", rx_go:"Download restored Excel",
+  t_rx_need:"Load the anonymized Excel (.xlsx) first", t_rx_making:"Restoring the Excel…",
+  t_rx_ok:"Restored Excel downloaded", t_rx_err:"Error while restoring the Excel",
+  t_rx_unknown:n=>"Excel restored · "+n+" placeholders are not in the dictionary and were left as they were",
   empty_rout:"The text with the real values will appear here.", rcopy:"Copy restored text",
   st_ent:"entities", st_uniq:"unique values", st_model:"from the model",
   st_regex:"from regex/checksum", st_chars:"characters", st_ocr:"pages read with OCR",
@@ -797,7 +872,7 @@ const T = {
   t_no_dict:"No dictionary: load a .json one", t_restored:"Values restored",
   t_nothing_copy:"Nothing to copy", t_restored_copied:"Restored text copied",
   t_dict_loaded:"Dictionary loaded", t_json_invalid:"Invalid JSON",
-  t_drag_pdf:"Unsupported format: use PDF, images (PNG, JPG, TIFF), .md or .txt",
+  t_drag_pdf:"Unsupported format: use PDF, images (PNG, JPG, TIFF), .xlsx, .md or .txt",
   t_text_loaded:"Text loaded",
   pii_found:(n,u)=>n+" PII found · "+u+" unique values",
   dict_n:n=>n+" IDs in the dictionary",
@@ -805,7 +880,7 @@ const T = {
   dict_session:n=>"session dictionary · "+n+" IDs",
   chars:n=>n.toLocaleString('en'),
   pages:n=>n+(n===1?" page":" pages"),
-  k_pdf:"PDF", k_image:"Image", k_text:"Text",
+  k_pdf:"PDF", k_image:"Image", k_text:"Text", k_xlsx:"Excel",
   ocr_native:"native text", ocr_running:(d,t)=>"OCR "+d+"/"+t+"…", ocr_starting:"starting OCR…",
   ocr_done:(n,s)=>"OCR · "+n+(n===1?" page":" pages")+" · "+s+" s",
   ocr_err:"OCR failed", ocr_missing_b:"OCR not available",
@@ -998,6 +1073,7 @@ const TEXT_EXT=/\.(md|markdown|txt|text)$/i;
 const IMG_EXT=/\.(png|jpe?g|jfif|tiff?|bmp|webp|gif)$/i;
 function fileKind(f){
   if(f.type==='application/pdf'||/\.pdf$/i.test(f.name))return 'pdf';
+  if(/\.xlsx$/i.test(f.name))return 'xlsx';
   if(/^image\//.test(f.type)||IMG_EXT.test(f.name))return 'image';
   if(TEXT_EXT.test(f.name)||/^text\//.test(f.type))return 'text';
   return null;
@@ -1023,6 +1099,7 @@ function resetDoc(){
   FILE=null;DOC=null;OCR_BOXES={};OUT_DOC=null;
   $('pdf').value='';$('pdfSrcView').innerHTML='';$('pdfSrcView').classList.remove('show-ocr');
   show($('srcTabs'),false);show($('ocrWarn'),false);setOcr(null);
+  show($('dlxlsx'),false);hideColumns();
   renderFileBar();setSrcView('text');
 }
 
@@ -1034,6 +1111,10 @@ async function onFile(f){
     $('src').value=await readTextFile(f);updateDrop();
     $('src').dispatchEvent(new Event('input'));
     toast(tt('t_text_loaded'));return;
+  }
+  if(k==='xlsx'){
+    // niente /preview: il foglio va come file a /analyze, /xlsx o /xlsx/columns/anonymize
+    FILE=f;renderFileBar();show($('dlxlsx'),true);loadColumns(f);return;
   }
   FILE=f;renderFileBar();
   show($('srcTabs'),true);show($('pdfSrcView'),true);show($('editor'),false);
@@ -1176,7 +1257,8 @@ async function run(){
     if(d.source_text&&FILE)$('src').value=d.source_text;
     DATA=d;off.clear();
     // senza dizionario non tocchiamo MAP ne' il localStorage: nessuna chiave nuova nasce
-    if(d.mapping_enabled!==false){MAP=d.mapping;try{localStorage.setItem('pii_map',JSON.stringify(MAP));}catch(e){}}
+    if(d.mapping_enabled!==false){MAP=d.mapping;MAP_TYPES={};
+      try{localStorage.setItem('pii_map',JSON.stringify(MAP));localStorage.removeItem('pii_types');}catch(e){}}
     render();
     toast(T[L].pii_found(d.n_entities,d.n_unique));
   }catch(e){toast(tt('t_error')+': '+e.message,false);}
@@ -1318,6 +1400,125 @@ $('dlpdf').onclick=async()=>{
   }finally{btn.disabled=false;btn.innerHTML=old;}
 };
 
+/* ---- Estrazione tabellare: profilo delle colonne e scelta per colonna.
+       Il profilo NON contiene valori del file, solo forme (AAAAAA99A99A999A). ---- */
+function hideColumns(){COLPROF=null;TAB_ON=false;show($('colCard'),false);}
+async function loadColumns(f){
+  hideColumns();
+  try{
+    const fd=new FormData();fd.append('file',f);
+    const r=await fetch('/xlsx/columns',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'');
+    if(FILE!==f)return;                // nel frattempo e' stato caricato un altro file
+    COLPROF=d;
+    // tabellare per default solo se il file ne ha la forma; sempre disattivabile
+    TAB_ON=d.columns.length>=8&&d.rows>=20;
+    renderColumns();
+  }catch(e){hideColumns();}          // non e' un'estrazione: resta la via col modello
+}
+function renderColumns(){
+  const d=COLPROF;if(!d)return;
+  show($('colCard'),true);
+  $('colToggle').checked=TAB_ON;
+  $('colInfo').textContent=T[L].col_info(d.sheet,d.rows,d.columns.length);
+  const tb=$('colrows');tb.innerHTML='';
+  for(const c of d.columns){
+    const tr=document.createElement('tr');
+    // textContent, mai innerHTML: le intestazioni vengono dal file dell'utente
+    const td=(txt,cls)=>{const e=document.createElement('td');if(cls)e.className=cls;
+      e.textContent=txt;tr.appendChild(e);return e;};
+    td(c.header||('#'+c.index),'k');
+    td(c.shape||'—','v');
+    td(String(c.distinct)+(c.distinct_capped?'+':''));
+    const tag=td(c.tag||'—');
+    if(c.reason)tag.title=c.reason;
+    if(c.quasi_identifier){const b=document.createElement('span');b.className='chip';
+      b.style.marginLeft='6px';b.textContent=tt('col_qi');b.title=tt('col_qi_t');tag.appendChild(b);}
+    const sel=document.createElement('select');sel.dataset.col=c.index;
+    for(const m of ['mask','keep','year','empty']){
+      const o=document.createElement('option');o.value=m;o.textContent=tt('m_'+m);
+      if(m===c.suggested_mode)o.selected=true;sel.appendChild(o);}
+    const ultima=document.createElement('td');ultima.appendChild(sel);tr.appendChild(ultima);
+    tb.appendChild(tr);
+  }
+}
+function colChoices(){
+  const out={};
+  for(const sel of document.querySelectorAll('#colrows select'))out[sel.dataset.col]=sel.value;
+  return out;
+}
+$('colToggle').onchange=e=>{TAB_ON=e.target.checked;};
+
+/* ---- Excel anonimizzato: lo stesso foglio caricato, con le celle anonimizzate e
+       formattazione/struttura intatte. Come /pdf, il dizionario non viene inviato:
+       il server lo ricostruisce e lo butta. ---- */
+$('dlxlsx').onclick=async()=>{
+  const file=FILE;
+  if(!file||!/\.xlsx$/i.test(file.name))return;
+  const btn=$('dlxlsx');btn.disabled=true;const old=btn.innerHTML;
+  btn.innerHTML='<span class="spin"></span> '+tt('t_xlsx_making');
+  try{
+    const fd=new FormData();fd.append('file',file);
+    // dizionario attivo: ci facciamo dare anche la chiave di ripristino (+ tipi delle celle)
+    if(MAPPING)fd.append('include_mapping','1');
+    let url='/xlsx';
+    if(TAB_ON&&COLPROF){                      // estrazione tabellare: si decide per colonna
+      url='/xlsx/columns/anonymize';
+      fd.append('columns',JSON.stringify(colChoices()));
+      if(COLPROF.sheet)fd.append('sheet',COLPROF.sheet);
+    }else if(TAGS_LOADED)fd.append('exclude_tags',[...EXCL].join(','));
+    const resp=await fetch(url,{method:'POST',body:fd});
+    if(!resp.ok){let m=tt('t_xlsx_err');try{m=(await resp.json()).error||m;}catch(_){}
+      toast(m,false);return;}
+    // residui = valori ancora leggibili; saltati = valori troppo corti per cercarli nel resto del file
+    let n;
+    if(MAPPING){
+      const d=await resp.json();
+      const bin=Uint8Array.from(atob(d.xlsx_base64),c=>c.charCodeAt(0));
+      saveBlob(new Blob([bin],{type:XLSX_MIME}),d.filename);
+      MAP=d.mapping;MAP_TYPES=d.types||{};
+      try{localStorage.setItem('pii_map',JSON.stringify(MAP));
+        localStorage.setItem('pii_types',JSON.stringify(MAP_TYPES));}catch(e){}
+      $('dictInfo').textContent=T[L].dict_session(Object.keys(MAP).length);
+      // accanto al file: senza questo JSON, in un'altra sessione l'Excel non si ripristina
+      saveBlob(new Blob([JSON.stringify({...MAP,_types:MAP_TYPES},null,2)],{type:'application/json'}),
+        d.filename.replace(/_anonimizzato\.xlsx$/,'')+'_dizionario.json');
+      n=(d.residual||0)+(d.skipped||0)+(d.left||0);   // "left" = modalita' per colonna
+    }else{
+      const fn=/filename=([^;]+)/.exec(resp.headers.get('Content-Disposition')||'');
+      saveBlob(await resp.blob(),fn?fn[1]:'foglio_anonimizzato.xlsx');
+      n=(+resp.headers.get('X-PII-Residual')||0)+(+resp.headers.get('X-PII-Skipped')||0)
+        +(+resp.headers.get('X-PII-Left')||0);
+    }
+    if(n>0)toast(T[L].t_xlsx_warn(n),false,9000);else toast(tt('t_xlsx_ok'));
+  }catch(e){toast(tt('t_xlsx_err')+': '+e.message,false);}
+  finally{btn.disabled=false;btn.innerHTML=old;}
+};
+
+/* ---- Excel ripristinato: l'Excel anonimizzato (anche modificato da un LLM) +
+       il dizionario della sessione o caricato da file -> valori veri nelle celle ---- */
+$('rxlsx').onchange=e=>{const f=e.target.files[0];$('rxlsxName').textContent=f?f.name:'';};
+$('rxlsxgo').onclick=async()=>{
+  const file=$('rxlsx').files[0];
+  if(!file){toast(tt('t_rx_need'),false);return;}
+  if(!Object.keys(MAP).length){toast(tt('t_no_dict'),false);return;}
+  const btn=$('rxlsxgo');btn.disabled=true;const old=btn.innerHTML;
+  btn.innerHTML='<span class="spin"></span> '+tt('t_rx_making');
+  try{
+    const fd=new FormData();fd.append('file',file);
+    fd.append('mapping',JSON.stringify({...MAP,_types:MAP_TYPES}));
+    const resp=await fetch('/xlsx/restore',{method:'POST',body:fd});
+    if(!resp.ok){let m=tt('t_rx_err');try{m=(await resp.json()).error||m;}catch(_){}
+      toast(m,false);return;}
+    const fn=/filename=([^;]+)/.exec(resp.headers.get('Content-Disposition')||'');
+    saveBlob(await resp.blob(),fn?fn[1]:'foglio_ripristinato.xlsx');
+    const u=+resp.headers.get('X-PII-Unknown')||0;
+    if(u>0)toast(T[L].t_rx_unknown(u),false,9000);else toast(tt('t_rx_ok'));
+  }catch(e){toast(tt('t_rx_err')+': '+e.message,false);}
+  finally{btn.disabled=false;btn.innerHTML=old;}
+};
+
 /* ---- reverse ---- */
 function reverse(){
   const txt=$('rin').value;
@@ -1377,13 +1578,17 @@ $('rclear').onclick=()=>{$('rin').value='';$('rout').innerHTML=routEmpty();$('ro
 $('dictFile').onchange=e=>{const f=e.target.files[0];if(!f)return;
   const r=new FileReader();r.onload=()=>{try{
     const parsed=JSON.parse(r.result);
+    // il dizionario di un Excel ha anche "_types": fuori dalla validazione e da MAP
+    const types=parsed&&typeof parsed._types==='object'&&parsed._types&&!Array.isArray(parsed._types)?parsed._types:{};
+    if(parsed&&typeof parsed==='object')delete parsed._types;
     const dictKeys=parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?Object.keys(parsed):[];
     // Un file dizionario corrotto/troncato con una chiave vuota o non testuale
     // degenera il pattern di reverse() in un match quasi universale e corrompe
     // l'intero documento al ripristino, non solo un placeholder.
     const valid=dictKeys.length>0&&dictKeys.every(k=>/^\[.+\]$/.test(k)&&typeof parsed[k]==='string');
     if(!valid){toast(tt('t_json_invalid'),false);return;}
-    MAP=parsed;
+    MAP=parsed;MAP_TYPES=types;
+    try{localStorage.setItem('pii_types',JSON.stringify(MAP_TYPES));}catch(e){}
     $('dictInfo').textContent=T[L].dict_loaded_n(dictKeys.length);
     toast(tt('t_dict_loaded'));}catch{toast(tt('t_json_invalid'),false);}};
   r.readAsText(f);};
@@ -1398,6 +1603,7 @@ function clearAll(){
   // senza queste righe il dizionario resta in MAP e su disco, e al riavvio
   // ricompare zitto al posto di quello del documento nuovo
   MAP={};try{localStorage.removeItem('pii_map');}catch(e){}$('dictInfo').textContent='';
+  MAP_TYPES={};try{localStorage.removeItem('pii_types');}catch(e){}
   $('pdfOutView').innerHTML='';setView('prev');updateDrop();
 }
 $('clear').onclick=clearAll;
@@ -1567,6 +1773,7 @@ applyLang((()=>{try{return localStorage.getItem('pii_lang');}catch(e){return nul
 loadSettings();
 updateDrop();
 /* recupera il dizionario della sessione precedente (dopo applyLang: testo nella lingua giusta) */
+try{MAP_TYPES=JSON.parse(localStorage.getItem('pii_types')||'{}')||{};}catch{}
 try{const m=localStorage.getItem('pii_map');if(m){MAP=JSON.parse(m);
   if(Object.keys(MAP).length)$('dictInfo').textContent=T[L].dict_session(Object.keys(MAP).length);}}catch{}
 </script>

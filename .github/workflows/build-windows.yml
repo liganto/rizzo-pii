@@ -74,7 +74,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir tokenizers numpy onnxruntime `
-            flask pymupdf pyinstaller "huggingface_hub[cli]" `
+            flask pymupdf openpyxl pyinstaller "huggingface_hub[cli]" `
             pyclipper pyyaml
 
       # Solo i file che finiscono nel sidecar: il grafo ONNX + i pesi (fp32, gli stessi del

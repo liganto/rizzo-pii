@@ -38,7 +38,7 @@ if BUNDLE_MODEL:
               for f in ("config.json", "tokenizer.json", "tokenizer_config.json",
                         "special_tokens_map.json")]
 datas += [("src/app/assets", "assets")]
-hiddenimports += ["fitz", "flask", "onnx_ner"]
+hiddenimports += ["fitz", "flask", "openpyxl", "onnx_ner"]
 
 # --- OCR delle scansioni (src/app/ocr.py -> src/app/docmd/): modelli ONNX in "ocr_models" ---
 # Si procurano con: python scripts/fetch_ocr_models.py  (-> models/ocr/). Si impacchettano

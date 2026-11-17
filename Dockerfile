@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (NB: transformers 5.x qui, mentre Dockerfile.linux resta sul 4.57.3 di PyInstaller.)
 RUN pip install --upgrade pip \
  && pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.0" \
- && pip install "transformers==5.14.1" tokenizers safetensors flask pymupdf gunicorn huggingface_hub \
+ && pip install "transformers==5.14.1" tokenizers safetensors flask pymupdf openpyxl gunicorn huggingface_hub \
       onnxruntime opencv-python-headless pyclipper pyyaml
 
 # --- modello -----------------------------------------------------------------

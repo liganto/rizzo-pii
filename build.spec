@@ -29,7 +29,7 @@ datas += [(f"{MODEL_DIR}/{f}", "pii_model")
           for f in ("config.json", "tokenizer.json", "tokenizer_config.json",
                     "special_tokens_map.json")]
 datas += [("src/app/assets", "assets")]   # mascotte/icone -> app.py le serve da _resource_path("assets")
-hiddenimports += ["fitz", "flask", "onnx_ner"]
+hiddenimports += ["fitz", "flask", "openpyxl", "onnx_ner"]
 
 # --- OCR delle scansioni (src/app/ocr.py -> src/app/docmd/): modelli ONNX in "ocr_models" ---
 # Si procurano con: python scripts/fetch_ocr_models.py  (-> models/ocr/). Si impacchettano

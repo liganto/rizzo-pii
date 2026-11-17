@@ -147,6 +147,69 @@ PR #36 per i corrispondenti esempi in `README.md`/`docs/`, così l'esempio nell'
 quello nella documentazione restano lo stesso codice fiscale.
 
 ---
+## 2026-09-16 — Estrazioni tabellari: si decide per colonna (`tabular.py`, `POST /xlsx/columns`)
+
+Provato il percorso col modello su un'estrazione vera (8.212 righe × 62 colonne, 3,46 M di
+caratteri): **58 colonne su 62 mascherate** — anno di competenza preso per numero di documento,
+sesso per documento d'identità, fasce e volumi per importi — e **2,5 ore** di CPU stimate. Il file
+usciva irriconoscibile e inservibile per l'analisi. Non è un difetto del modello: è addestrato sulla
+**prosa**, e in una cella di un export gestionale un numero a cinque cifre non ha contesto.
+
+In una tabella però l'informazione sta nello schema: la colonna dice cos'è il valore. Quindi si
+decide **una volta per colonna** invece di indovinare cella per cella:
+
+- `profile()` propone il trattamento incrociando il **nome** della colonna e i **valori**, questi
+  ultimi passati alla rete regex+checksum già usata accanto al modello: una colonna di CF o IBAN
+  viene riconosciuta anche se si chiama `avg(0)`. Dai valori accettiamo solo le famiglie con
+  checksum o forma inequivocabile, altrimenti una matricola passerebbe per importo;
+- il profilo espone **forme** (`AAAAAA99A99A999A`), mai valori: si può mostrare e loggare;
+- modalità per colonna: `mask` (reversibile), `year` (di una data resta l'anno: l'analisi per età
+  sopravvive, la data esatta no), `empty`, `keep`;
+- dizionario identico a quello di `xlsx_export`, quindi il **ripristino era già fatto**;
+- `quasi_identifier`: le colonne con poche categorie (provincia, sesso, regime) vengono segnalate,
+  perché da sole non identificano ma incrociate sì. È pseudonimizzazione, non anonimizzazione.
+
+Sullo stesso file reale: 10 colonne trattate, 49.148 celle, **secondi** invece di 2,5 ore, zero
+falsi positivi sulle misure e ritorno verificato identico all'originale su ~509.000 celle (valori,
+tipi e riempimenti compresi).
+
+## 2026-09-15 — Excel `.xlsx`: anonimizzazione cella per cella (`xlsx_export.py`, `POST /xlsx`)
+
+Finora un foglio Excel si poteva solo **incollare** come TSV (issue #54), perdendo il file: niente
+formattazione, niente fogli multipli, e il risultato andava ricomposto a mano. Convertire in PDF è
+peggio: colonne tagliate tra le pagine e nessuna strada per tornare a un `.xlsx`. Ora si carica il
+`.xlsx` e si riscarica **lo stesso workbook** con le PII sostituite.
+
+Scelte che contano:
+
+- **un testo solo, una sola `analyze()`**: il workbook viene steso come TSV (la forma già resa
+  robusta dal fix di #54) e ogni pezzo ricorda la cella di origine. Il modello vede la riga come
+  contesto e i placeholder sono coerenti su tutti i fogli; un'inferenza a chunk invece di una per cella;
+- **propagazione dei valori** come in `redact_pdf`: ciò che il modello trova in una cella viene
+  sostituito ovunque nel file, per token e a confini di parola, **mai a cavallo di due celle**
+  ("Mario" | "Rossi" non matcha "Mario Rossi"). Indice per primo token, non una regex con migliaia di
+  alternative;
+- **tipi conservati**: le celle non toccate restano numeri/date; solo quelle con una PII diventano testo;
+- **pulizia dei posti invisibili**: letterali nelle formule, commenti (+ autore), intestazioni/piè di
+  pagina, nomi dei fogli, hyperlink, proprietà del documento, link esterni e **tabelle pivot** (la cache
+  è una copia integrale dei dati sorgente);
+- **verifica finale** rileggendo l'output, estesa a ciò che non riscriviamo (nomi definiti, convalide
+  dati): stessi header `X-PII-Residual`/`X-PII-Skipped` del PDF e stesso avviso nell'UI.
+
+**Ripristino dell'Excel** (`restore_workbook()`, `POST /xlsx/restore`, scheda "Ripristina"). Il caso
+d'uso: anonimizzo, mando il file a un LLM che lo lavora (colonne di analisi, righe nuove), rimetto i
+nomi veri nel risultato. Con il dizionario attivo `/xlsx` consegna anche la chiave
+(`include_mapping=1` → JSON; l'UI scarica `<nome>_dizionario.json`), che porta con sé il **tipo**
+delle celle che erano interamente un numero o una data: al ritorno `38500` è di nuovo un numero, non
+il testo "38500". Tolleranza come il ripristino del testo (`[ FULLNAME_1 ]`, `FULLNAME_1`, che è anche
+la forma dei nomi dei fogli senza quadre); i placeholder sconosciuti restano e vengono contati.
+Non torna ciò che è stato rimosso (autori, hyperlink, pivot) e la grafia è quella del dizionario,
+una per valore.
+
+Limiti: `.xls` (Excel 97-2003) non supportato, va salvato come `.xlsx`; grafici e immagini non
+sopravvivono (openpyxl non li conserva); le formule che citano per nome un foglio rinominato non
+vengono riscritte. Nuova dipendenza **`openpyxl`** (requirements, Dockerfile, spec PyInstaller, script
+di build). Test in `tests/test_xlsx_export.py`, senza modello.
 
 ## 2026-08-07 — `Dockerfile`: l'app come webapp in un container
 

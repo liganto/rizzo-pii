@@ -40,7 +40,7 @@ def _carica():
         if isinstance(nodo, ast.Assign) and any(
                 getattr(t, "id", "") in ("TEXT_EXTS", "PDF_MAGIC") for t in nodo.targets):
             exec(compile(ast.Module([nodo], []), "app.py", "exec"), ns)
-        elif isinstance(nodo, ast.FunctionDef) and nodo.name in ("_is_pdf", "_text_from_bytes"):
+        elif isinstance(nodo, ast.FunctionDef) and nodo.name in ("_is_pdf", "_is_xlsx", "_text_from_bytes"):
             exec(compile(ast.Module([nodo], []), "app.py", "exec"), ns)
     return ns["_text_from_bytes"]
 

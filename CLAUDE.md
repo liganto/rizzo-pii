@@ -82,14 +82,15 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   **prima di caricare il modello** (evita secondi sprecati). Tauri riconosce il codice 76 e mostra
   il form di configurazione nello splash screen.
 - `app.py` — server Flask (la **UI** sta in `ui/index.html`, servita cosi' com'e', riletta a ogni
-  richiesta in sviluppo): testo, PDF, **scansioni e immagini** (OCR) o file `.md`/`.txt`, chunking con overlap, offset
+  richiesta in sviluppo): testo, PDF, **scansioni e immagini** (OCR), Excel `.xlsx` o file `.md`/`.txt`, chunking con overlap, offset
   globali + dedup. Anonimizzazione **reversibile** (ogni PII → `[FULLNAME_1]`/`[IBAN_1]`… +
   dizionario locale; tab "Ripristina"). Affianca al modello una **rete regex/checksum** (EMAIL/
   TELEFONO/IBAN/CF/PIVA/carta/importo/targa/**URL**; IBAN/CF/PIVA/carta validati con checksum, che ha
   priorità sul modello). `URL` è un **23° tag solo-regex**: il modello non lo conosce; matcha schema,
   `www.` e domini nudi solo su una **lista chiusa di TLD** (senza, `p.iva`/`S.r.l.` diventerebbero
   domini). `APP_VERSION`. Endpoint: `GET /health` (readiness senza inference, 200/503, + stato OCR),
-  `POST /analyze`, `POST /pdf`, `POST /preview`, `POST /pdf/preview`, **`POST /ocr`**,
+  `POST /analyze`, `POST /pdf`, `POST /xlsx`, `POST /xlsx/restore`,
+  `POST /xlsx/columns`, `POST /xlsx/columns/anonymize`, `POST /preview`, `POST /pdf/preview`, **`POST /ocr`**,
   `GET /doc/<id>/page/<n>.png`, `GET /doc/<id>/file.pdf`, `GET/POST /settings` (alias storico `/tags`),
   `GET/POST /config`, `GET /port-check`; CLI `--host`/`--port`/`--exclude-tags`/`--no-mapping`.
   Le sorgenti di una richiesta passano da `_read_source()`: file caricato (campo `file`/`pdf`) **oppure
@@ -178,6 +179,52 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   `backend`. Gli spec PyInstaller impacchettano **solo** il modello ONNX + tokenizer/config ed
   **escludono torch/transformers** (sidecar 1,8 → 1,4 GB, avvio ~2× più rapido). Dettagli in
   `docs/BUILD.md` § Modello ONNX.
+- `xlsx_export.py` + endpoint **`POST /xlsx`** — **download dell'Excel anonimizzato**, pulsante
+  "📊 Scarica Excel anonimizzato" (visibile solo con un `.xlsx` caricato). Due tempi con `analyze()`
+  in mezzo: `read_workbook()` **stende** il workbook in un testo solo (una riga per riga, celle
+  separate da TAB, tutti i fogli compresi i nascosti; TAB/a-capo interni a una cella → spazio 1:1,
+  gli offset restano esatti) dove ogni pezzo è un'**unità** che ricorda la sua origine (cella,
+  letterale di formula, commento, intestazione/piè di pagina, nome foglio); `write_workbook()`
+  riporta i placeholder nelle unità. **Un'unica `analyze()`** per tutto il file: contesto di riga al
+  modello + numerazione coerente tra fogli. Poi **propagazione**: ogni valore del dizionario è cercato
+  ovunque per token (a confini di parola, mai a cavallo di due celle; valori < 2 alfanumerici o di 2
+  cifre esclusi = `skipped`, stessa soglia di `pdf_export._too_noisy`). Tipo delle celle non toccate
+  conservato; numero/data con PII → testo. Rimossi: hyperlink con un valore trovato, proprietà
+  documento, link esterni, **pivot** (la cache è una copia dei dati). Autore commenti → `anonimo`
+  (con `""` openpyxl scrive `"None"`). Verifica finale rileggendo il file (anche nomi definiti e
+  convalide, non riscritti) → `residual`. Serve `mapping_enabled=True` internamente (i segmenti
+  devono avere `t`). `.xls` rifiutato con messaggio. Test: `tests/test_xlsx_export.py` (solo openpyxl,
+  si salta se manca).
+  **Ripristino** (`restore_workbook()` + **`POST /xlsx/restore`**, scheda "Ripristina" → "📊 Carica
+  Excel anonimizzato"): rimette i valori in celle/formule (virgolette raddoppiate)/commenti/
+  intestazioni/nomi fogli, tollerante come `reverse()` (`[ FULLNAME_1 ]`, `FULLNAME_1` a confini di
+  parola; sconosciuti tra quadre → `X-PII-Unknown`), anche su un file modificato da un LLM. Nessuna
+  inferenza. Il dizionario per un Excel è `{placeholder: valore, "_types": {placeholder: "int"|
+  "float"|"datetime"|"date"|"time"}}`: `write_workbook` registra il tipo solo se il placeholder copre
+  la cella **intera** numero/data (`report["types"]`); nell'UI `MAP` tiene solo i placeholder
+  (`phOnly`) e i tipi stanno in `MAP_TYPES` (localStorage `pii_types`). `/xlsx` con
+  `include_mapping=1` risponde JSON `{filename, xlsx_base64, mapping, types, ...}` e l'UI, a
+  dizionario attivo, scarica anche `<nome>_dizionario.json`; senza il campo resta il binario.
+- `tabular.py` + **`POST /xlsx/columns`** (profilo) e **`POST /xlsx/columns/anonymize`** —
+  **estrazioni tabellari: si decide PER COLONNA, senza modello.** Perché: il modello è addestrato
+  sulla prosa; su un export gestionale (62 colonne, celle = numeri nudi) maschera 58 colonne su 62
+  (misurato: fasce, volumi, anni, sesso) e costa ore. In una tabella lo schema dice già cos'è il
+  valore. `profile()` → per colonna tipo/distinti/vuote/**forma** (lettere→A, cifre→9; **nessun
+  valore reale esce**, si può loggare) + `tag`/`suggested_mode` dedotti da (1) nome colonna
+  (`_BY_NAME`) e (2) valori dati a `detectors.detect_regex`, accettando solo le famiglie `_STRONG`
+  (checksum o forma inequivocabile: CF/PIVA/IBAN/carta/EMAIL/TELEFONO/TARGA — altrimenti una
+  matricola "10000" passa per importo e scavalca il nome). `quasi_identifier` = distinti ≤ ~2% delle
+  righe (min 2, max 200): provincia/sesso/regime non identificano da soli ma incrociati sì.
+  `anonymize(data, {colonna: mode})` con `mode` ∈ `mask` (placeholder reversibile, prefisso = tag o
+  intestazione sanificata `[A-Z][A-Z0-9_]*`), `year` (data → solo anno, non reversibile), `empty`,
+  `keep`. Dizionario = quello di `xlsx_export` → **ripristino già pronto** via `/xlsx/restore`;
+  valori salvati col riempimento di spazi (campi a lunghezza fissa) per un ritorno identico.
+  `report["left"]` = rete di sicurezza (celle non trattate nelle colonne scelte; deve essere 0).
+  Un foglio per volta (`sheet`, `header_row`). UI: pannello "Colonne del foglio" (`#colCard`,
+  `loadColumns`/`renderColumns`/`colChoices`, `TAB_ON`), attivo di default con ≥8 colonne e ≥20
+  righe; il pulsante "Scarica Excel anonimizzato" instrada su `/xlsx` o `/xlsx/columns/anonymize`.
+  Test: `tests/test_tabular.py` (senza modello; CF/PIVA del fixture con checksum calcolato dai
+  validatori del prodotto).
 - `serve.py` — entry **headless** (solo Flask, niente browser): è il backend dell'app Tauri; log su
   `%LOCALAPPDATA%\rizzo-pii\backend.log`. Pre-check porta + `sys.exit(76)` se occupata.
   `desktop_app.py` — entry PyInstaller legacy (apre il browser); stesso pre-check.

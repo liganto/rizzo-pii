@@ -25,9 +25,10 @@ huggingface_hub
 wandb
 python-dotenv
 
-# Local anonymization app (Flask UI + PDF parsing)
+# Local anonymization app (Flask UI + PDF parsing + Excel)
 flask
 pymupdf
+openpyxl
 # Inferenza dell'app senza torch (src/app/onnx_ner.py) + export (src/training/export_onnx.py)
 onnx
 onnxruntime
